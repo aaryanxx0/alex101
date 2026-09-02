@@ -15,3 +15,4 @@ data/
 runtime/
 *.tsbuildinfo
 next-env.d.ts
+.vercel
