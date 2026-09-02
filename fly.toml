@@ -1,0 +1,43 @@
+---
+# Fly.io launches are minimal — use `fly launch --no-deploy` then
+# `fly deploy` after editing this file.
+app: alex101-bot-worker
+primary_region: "iad"
+
+build:
+  dockerfile: Dockerfile
+
+env:
+  BOT_WORKER_HOST: "0.0.0.0"
+  BOT_WORKER_PORT: "4000"
+  BOT_WORKER_VIEWER_PORT: "4001"
+  BOT_WORKER_CONFIG: "/data/settings.json"
+  AUTO_CONNECT: "1"
+  DEFAULT_MC_HOST: "mc.238458.xyz"
+  DEFAULT_MC_USERNAME: "Alex101"
+  DEFAULT_MC_VERSION: "1.21.11"
+
+internal_ports:
+  - 4000
+  - 4001
+
+[[services]]
+  protocol: tcp
+  internal_port: 4000
+  auto_stop_machines: false
+  [[services.ports]]
+    port: 80
+    handlers: ["http"]
+    force_https: true
+
+[[services]]
+  protocol: tcp
+  internal_port: 4001
+  auto_stop_machines: false
+  [[services.ports]]
+    port: 81
+    handlers: ["http"]
+
+[mounts]
+  source = "alex101_data"
+  destination = "/data"

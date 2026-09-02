@@ -1,0 +1,27 @@
+services:
+  bot-worker:
+    build: .
+    image: alex101-bot-worker:latest
+    container_name: alex101-bot-worker
+    restart: unless-stopped
+    ports:
+      - "4000:4000"   # realtime gateway (HTTP + WebSocket)
+      - "4001:4001"   # prismarine-viewer (WebGL canvas)
+    environment:
+      BOT_WORKER_HOST: 0.0.0.0
+      BOT_WORKER_PORT: 4000
+      BOT_WORKER_VIEWER_PORT: 4001
+      BOT_WORKER_CONFIG: /data/settings.json
+      BOT_WORKER_SECRET: ${BOT_WORKER_SECRET:?set BOT_WORKER_SECRET}
+      DEFAULT_MC_HOST: mc.238458.xyz
+      DEFAULT_MC_PORT: "25565"
+      DEFAULT_MC_USERNAME: Alex101
+      DEFAULT_MC_VERSION: "1.21.11"
+      DEFAULT_MC_AUTH: offline
+      VIEW_DISTANCE: "6"
+      AUTO_CONNECT: "1"
+    volumes:
+      - alex101-data:/data
+
+volumes:
+  alex101-data:

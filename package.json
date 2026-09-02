@@ -1,0 +1,25 @@
+{
+  "name": "alex101-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-controlled Minecraft Java bot Alex101. Vercel-hosted dashboard + persistent Mineflayer worker for mc.238458.xyz (1.21.11).",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:shared": "npm run build --workspace @alex101/shared",
+    "build:worker": "npm run build --workspace @alex101/bot-worker",
+    "build:dashboard": "npm run build --workspace @alex101/dashboard",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "dev:worker": "npm run dev --workspace @alex101/bot-worker",
+    "dev:dashboard": "npm run dev --workspace @alex101/dashboard"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

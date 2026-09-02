@@ -1,0 +1,3 @@
+version: 1
+disable_existing_log_rules: true
+auto-deploy: true
