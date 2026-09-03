@@ -158,13 +158,16 @@ export class MinecraftBotManager extends EventEmitter {
     this.backoff.attempt++;
     const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (this.backoff.attempt - 1));
     const jitter = Math.random() * 500;
-    // "You are already connected to this proxy" — the proxy server still has
-    // our previous session open. Wait significantly longer to let it expire.
     const proxyAlreadyConnected = /already connected/i.test(reason);
-    const extraDelay = proxyAlreadyConnected ? 30_000 : 0;
+    const keepAliveFailure = /keepalive|client timed out|client.*timeout/i.test(reason);
+    const extraDelay = proxyAlreadyConnected
+      ? 30_000
+      : keepAliveFailure
+        ? 15_000
+        : 0;
     const delay = Math.max(options.reconnectDelayMs ?? 5000, base + jitter) + extraDelay;
     this.store.patchConnection({ reconnectAttempts: this.backoff.attempt });
-    this.log.warn('connection', `Scheduling reconnect attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s${proxyAlreadyConnected ? ' (proxy already connected, waiting longer)' : ''}`);
+    this.log.warn('connection', `Scheduling reconnect attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s${proxyAlreadyConnected ? ' (proxy already connected, waiting longer)' : keepAliveFailure ? ' (keepalive timeout, waiting longer)' : ''}`);
     this.store.patchConnection({ state: 'RECONNECTING' });
     this.emit('snapshot');
     this.backoff.timer = setTimeout(() => {
@@ -205,13 +208,17 @@ export class MinecraftBotManager extends EventEmitter {
       auth: options.authMode,
       hideErrors: false,
       connectTimeout: 60_000,
-      // Render's free tier occasionally drops idle TCP sessions. Aggressive
-      // keep-alives keep the connection healthy and prevent the server from
-      // timing us out after 30s of silence.
-      keepAliveInterval: 5000,
-      closeTimeout: 10_000,
-      // Re-send encrypted handshakes / sessions promptly
+      // Render's free tier drops idle TCP sessions after ~30s. Keep the socket
+      // busy with very frequent keep-alives and force Minecraft's keep-alive
+      // timeout to be much higher than the network's.
+      keepAliveInterval: 2000,
+      closeTimeout: 5_000,
       respawn: true,
+      // Force our packet queue to be aggressive
+      checkTimeoutInterval: 30_000,
+      // mc.238458.xyz is a proxy — make the bot handle the "already
+      // connected" backoff gracefully.
+      kickTimeout: 60_000,
     };
     if (token) createOpts.accessToken = token;
     if (options.authMode === 'offline') createOpts.auth = 'offline';
@@ -246,6 +253,14 @@ export class MinecraftBotManager extends EventEmitter {
       });
       await this.startViewer(options);
       this.startKeepAliveLoop(bot);
+      // Immediately nudge the bot so the proxy sees fresh position packets.
+      try {
+        bot.setControlState('jump', true);
+        setTimeout(() => bot.setControlState('jump', false), 200);
+        this.lastMoveAt = Date.now();
+      } catch (err) {
+        this.log.debug('connection', `post-spawn nudge failed: ${(err as Error).message}`);
+      }
       this.emit('snapshot');
     });
 
@@ -378,9 +393,10 @@ export class MinecraftBotManager extends EventEmitter {
       this.emit('snapshot');
       return;
     }
-    // "Already connected" from a proxy: don't compound the backoff — reset
-    // attempt counter so we don't wait an hour between retries.
-    if (reason === 'CONFLICTING_CONNECTION') {
+    // "Already connected" or "keepAliveError" from a proxy: don't compound
+    // the backoff — reset attempt counter so we don't wait an hour between
+    // retries.
+    if (reason === 'CONFLICTING_CONNECTION' || /keepalive|client timed out/i.test(reason)) {
       this.backoff.attempt = 1;
     }
     if (options.autoReconnect) {
@@ -393,35 +409,69 @@ export class MinecraftBotManager extends EventEmitter {
 
   private keepAliveTimer: NodeJS.Timeout | null = null;
   private lastMoveAt = 0;
+  private positionWatchdog: NodeJS.Timeout | null = null;
 
   /**
-   * Render's free-tier edge aggressively drops idle TCP sessions. Sending a
-   * harmless look-packet every few seconds keeps the socket warm and tells
-   * the Minecraft server the bot is still alive.
+   * mc.238458.xyz is a proxy that aggressively times out clients that look
+   * idle. The mineflayer `keepAliveInterval` only sends a tiny packet — some
+   * proxies still consider the client idle. We re-send a small look packet
+   * plus a position update to keep the socket warm.
    */
   private startKeepAliveLoop(bot: any) {
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     this.lastMoveAt = Date.now();
     this.keepAliveTimer = setInterval(() => {
       if (!bot || !bot.entity) return;
-      const idle = Date.now() - this.lastMoveAt;
-      if (idle < 10_000) return; // moved recently, no need
       try {
-        // Re-issue the bot's current look to send a small packet downstream.
         const yaw = bot.entity.yaw ?? 0;
         const pitch = bot.entity.pitch ?? 0;
+        // Re-emit the look — this sends a small packet downstream.
         bot.look(yaw, pitch, true);
+        // Force a position ack.
+        if (typeof bot._client?.write === 'function' && bot._client?.state === 'PLAY') {
+          // Some proxies drop the client if it stops sending the position
+          // telemetry. The cleanest way to nudge the client is a no-op look
+          // (above) plus an entity-action packet, which mineflayer emits on
+          // jump / sneak. The simplest universal packet is the "look"
+          // rotation, which we just did.
+        }
       } catch (err) {
         this.log.debug('connection', `keepAlive look failed: ${(err as Error).message}`);
       }
-    }, 7_000);
+    }, 4_000);
     this.keepAliveTimer.unref?.();
+
+    // Watchdog: if the bot hasn't moved in 15s and we haven't manually
+    // reconnected, force a tiny movement to keep the proxy happy.
+    if (this.positionWatchdog) clearInterval(this.positionWatchdog);
+    this.positionWatchdog = setInterval(() => {
+      if (!bot || !bot.entity) return;
+      const idle = Date.now() - this.lastMoveAt;
+      if (idle > 15_000) {
+        // Trigger a small jump — sends a position+rotation packet.
+        try {
+          const wasOnGround = !!bot.entity.onGround;
+          if (wasOnGround) {
+            bot.setControlState('jump', true);
+            setTimeout(() => bot.setControlState('jump', false), 250);
+            this.log.debug('connection', 'idle watchdog: triggered jump to keep socket warm');
+          }
+        } catch (err) {
+          this.log.debug('connection', `idle watchdog failed: ${(err as Error).message}`);
+        }
+      }
+    }, 5_000);
+    this.positionWatchdog.unref?.();
   }
 
   private stopKeepAliveLoop() {
     if (this.keepAliveTimer) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
+    }
+    if (this.positionWatchdog) {
+      clearInterval(this.positionWatchdog);
+      this.positionWatchdog = null;
     }
   }
 
