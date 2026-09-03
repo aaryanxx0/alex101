@@ -293,6 +293,8 @@ export interface ConnectOptions {
   autoReconnect: boolean;
   reconnectDelayMs: number;
   viewDistance: number;
+  /** AuthMe-style in-game login password. Sent as /login after spawn. Never logged. */
+  authPassword?: string;
 }
 
 export interface PersistedSettings {
@@ -308,6 +310,8 @@ export interface PersistedSettings {
   followDistance: number;
   autoRespawn: boolean;
   enableRendering: boolean;
+  /** In-game auth password (AuthMe-style plugins). Stored on worker only. Never logged. */
+  authPassword: string;
 }
 
 export const DEFAULT_SETTINGS: PersistedSettings = {
@@ -323,6 +327,7 @@ export const DEFAULT_SETTINGS: PersistedSettings = {
   followDistance: 3,
   autoRespawn: true,
   enableRendering: true,
+  authPassword: '',
 };
 
 /**

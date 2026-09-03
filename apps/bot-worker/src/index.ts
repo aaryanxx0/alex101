@@ -161,6 +161,7 @@ app.post('/auth/token', (req: Request, res: Response) => {
           autoReconnect: settings.autoReconnect,
           reconnectDelayMs: settings.reconnectDelayMs,
           viewDistance: settings.viewDistance,
+          authPassword: settings.authPassword ?? '',
         }).catch((err) => log.error('worker', `AUTO_CONNECT failed: ${err.message}`));
       } else {
         log.warn('worker', 'No settings found; open the dashboard to configure and click Connect.');

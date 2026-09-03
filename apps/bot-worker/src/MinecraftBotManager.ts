@@ -134,6 +134,7 @@ export class MinecraftBotManager extends EventEmitter {
       autoReconnect: options.autoReconnect,
       reconnectDelayMs: options.reconnectDelayMs,
       viewDistance: options.viewDistance,
+      authPassword: options.authPassword ?? '',
     });
     await this.attempt(options, /* manual */ false);
   }
@@ -261,6 +262,9 @@ export class MinecraftBotManager extends EventEmitter {
       } catch (err) {
         this.log.debug('connection', `post-spawn nudge failed: ${(err as Error).message}`);
       }
+      // AuthMe-style servers kick unauthenticated players after ~30s.
+      // Log in automatically if a password is configured.
+      this.runInGameAuth(bot, options);
       this.emit('snapshot');
     });
 
@@ -321,6 +325,7 @@ export class MinecraftBotManager extends EventEmitter {
       };
       this.store.pushChat(msg);
       this.emit('chat', msg);
+      this.handleAuthPrompt(bot, text, options);
       this.emit('snapshot');
     });
 
@@ -336,6 +341,7 @@ export class MinecraftBotManager extends EventEmitter {
       };
       this.store.pushChat(msg);
       this.emit('chat', msg);
+      this.handleAuthPrompt(bot, message, options);
       this.emit('snapshot');
     });
 
@@ -410,6 +416,59 @@ export class MinecraftBotManager extends EventEmitter {
   private keepAliveTimer: NodeJS.Timeout | null = null;
   private lastMoveAt = 0;
   private positionWatchdog: NodeJS.Timeout | null = null;
+
+  /**
+   * Servers protected by AuthMe-style plugins kick players that never run
+   * /login. If the user configured a password, authenticate right after
+   * spawn. Never logs the password itself.
+   */
+  private runInGameAuth(bot: any, options: ConnectOptions) {
+    const pw = options.authPassword ?? '';
+    if (!pw) {
+      this.log.info('auth', 'No in-game password configured — if the server requires /login, set "In-game password" in Settings');
+      return;
+    }
+    const sendLogin = () => {
+      try {
+        bot.chat(`/login ${pw}`);
+        this.log.success('auth', 'Sent in-game /login command');
+      } catch (err) {
+        this.log.warn('auth', `in-game login failed: ${(err as Error).message}`);
+      }
+    };
+    setTimeout(sendLogin, 1200);
+  }
+
+  /**
+   * Detect "not registered" / "not authenticated" prompts in chat and react
+   * with /register or /login using the configured password.
+   */
+  private handleAuthPrompt(bot: any, text: string, options: ConnectOptions) {
+    const pw = options.authPassword ?? '';
+    if (!pw) return;
+    const t = text.toLowerCase();
+    if (/not\s+registered|register.*with|\/register/.test(t) && /register/.test(t)) {
+      this.log.warn('auth', 'Server reports bot is not registered — sending /register');
+      try {
+        bot.chat(`/register ${pw} ${pw}`);
+        this.log.success('auth', 'Sent in-game /register command');
+        setTimeout(() => {
+          try {
+            bot.chat(`/login ${pw}`);
+            this.log.success('auth', 'Sent in-game /login command after register');
+          } catch {}
+        }, 1500);
+      } catch (err) {
+        this.log.warn('auth', `in-game register failed: ${(err as Error).message}`);
+      }
+    } else if (/not\s+authenticated|please (log ?in|authenticate)|use \/login/.test(t)) {
+      this.log.warn('auth', 'Server reports bot is not authenticated — re-sending /login');
+      try {
+        bot.chat(`/login ${pw}`);
+        this.log.success('auth', 'Sent in-game /login command (retry)');
+      } catch {}
+    }
+  }
 
   /**
    * mc.238458.xyz is a proxy that aggressively times out clients that look
@@ -526,11 +585,10 @@ export class MinecraftBotManager extends EventEmitter {
         });
       } catch {}
       try {
-        this.bot.removeAllListeners();
+        b.removeAllListeners();
       } catch (err) {
         this.log.warn('connection', `Bot removeListeners error: ${(err as Error).message}`);
       }
-      this.bot = null;
     }
     this.store.patchViewer({ ready: false, socketConnected: false });
   }
@@ -595,7 +653,12 @@ export class MinecraftBotManager extends EventEmitter {
     if (!message || typeof message !== 'string') return;
     try {
       this.bot.chat(message);
-      this.log.info('chat', `Sent: ${message}`);
+      // Never log the raw command if it carries the in-game password.
+      if (/^\/(login|register|l)\s/i.test(message)) {
+        this.log.info('chat', 'Sent auth command (contents redacted)');
+      } else {
+        this.log.info('chat', `Sent: ${message}`);
+      }
     } catch (err) {
       this.log.warn('chat', `chat failed: ${(err as Error).message}`);
     }

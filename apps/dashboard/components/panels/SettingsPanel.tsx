@@ -1,26 +1,13 @@
 'use client';
 
 import { useState } from 'react';
-import type { AuthMode, BotSnapshot, ConnectOptions } from '@alex101/shared';
+import type { AuthMode, BotSnapshot, ConnectOptions, PersistedSettings } from '@alex101/shared';
 
 interface Props {
   snapshot: BotSnapshot | null;
   onConnect: (opts: ConnectOptions) => void;
   onDisconnect: () => void;
-  onUpdateSettings: (s: Partial<{
-    host: string;
-    port: number;
-    username: string;
-    version: string;
-    authMode: AuthMode;
-    autoReconnect: boolean;
-    reconnectDelayMs: number;
-    viewDistance: number;
-    mouseSensitivity: number;
-    followDistance: number;
-    autoRespawn: boolean;
-    enableRendering: boolean;
-  }>) => void;
+  onUpdateSettings: (s: Partial<PersistedSettings>) => void;
   onLookAtCoords: (x: number, y: number, z: number) => void;
 }
 
@@ -38,6 +25,7 @@ export function SettingsPanel({ snapshot, onConnect, onDisconnect, onUpdateSetti
   const [followDistance, setFollowDistance] = useState(3);
   const [autoRespawn, setAutoRespawn] = useState(true);
   const [enableRendering, setEnableRendering] = useState(true);
+  const [authPassword, setAuthPassword] = useState('');
   const [lx, setLx] = useState('0');
   const [ly, setLy] = useState('64');
   const [lz, setLz] = useState('0');
@@ -62,13 +50,23 @@ export function SettingsPanel({ snapshot, onConnect, onDisconnect, onUpdateSetti
           <div><label>View distance (chunks)</label>
             <input type="number" min={1} max={32} value={viewDistance} onChange={(e) => setViewDistance(Math.max(1, Math.min(32, Number(e.target.value))))} />
           </div>
+          <div>
+            <label>In-game password (AuthMe /login) — optional</label>
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Only if the server asks Alex101 to /login"
+              autoComplete="off"
+            />
+          </div>
         </div>
         <div className="row" style={{ gap: 16, marginTop: 12 }}>
           <label><input type="checkbox" checked={autoReconnect} onChange={(e) => setAutoReconnect(e.target.checked)} /> Auto-reconnect</label>
           <label><input type="checkbox" checked={enableRendering} onChange={(e) => setEnableRendering(e.target.checked)} /> Enable WebGL viewer</label>
         </div>
         <div className="row" style={{ gap: 8, marginTop: 12 }}>
-          <button className="primary" onClick={() => onConnect({ host, port, username, version, authMode, autoReconnect, reconnectDelayMs, viewDistance })}>
+          <button className="primary" onClick={() => onConnect({ host, port, username, version, authMode, autoReconnect, reconnectDelayMs, viewDistance, authPassword })}>
             {snapshot?.connection.state === 'OFFLINE' || snapshot?.connection.state === 'ERROR' ? 'Connect' : 'Reconnect'}
           </button>
           <button className="danger" onClick={onDisconnect} disabled={snapshot?.connection.state === 'OFFLINE'}>Disconnect</button>
@@ -102,7 +100,7 @@ export function SettingsPanel({ snapshot, onConnect, onDisconnect, onUpdateSetti
             </select>
           </div>
         </div>
-        <button style={{ marginTop: 8 }} onClick={() => onUpdateSettings({ autoReconnect, reconnectDelayMs, viewDistance, mouseSensitivity, followDistance, autoRespawn, enableRendering })}>
+        <button style={{ marginTop: 8 }} onClick={() => onUpdateSettings({ autoReconnect, reconnectDelayMs, viewDistance, mouseSensitivity, followDistance, autoRespawn, enableRendering, authPassword })}>
           Save preferences
         </button>
       </div>

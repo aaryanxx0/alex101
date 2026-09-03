@@ -219,6 +219,7 @@ export class RealtimeGateway {
           autoReconnect: settings.autoReconnect,
           reconnectDelayMs: settings.reconnectDelayMs,
           viewDistance: settings.viewDistance,
+          authPassword: settings.authPassword ?? '',
         };
         this.deps.bot.connect(options).catch(() => undefined);
         return;
