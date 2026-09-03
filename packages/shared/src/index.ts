@@ -29,6 +29,7 @@ export type DisconnectReason =
   | 'WHITELIST_REJECTION'
   | 'SERVER_FULL'
   | 'BANNED'
+  | 'CONFLICTING_CONNECTION'
   | 'KICKED'
   | 'CONNECTION_RESET'
   | 'SERVER_RESTART'

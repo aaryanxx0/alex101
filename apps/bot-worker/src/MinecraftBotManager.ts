@@ -152,15 +152,19 @@ export class MinecraftBotManager extends EventEmitter {
     this.emit('snapshot');
   }
 
-  private scheduleReconnect(options: ConnectOptions) {
+  private scheduleReconnect(options: ConnectOptions, reason: string = 'unknown') {
     if (!options.autoReconnect) return;
     if (this.backoff.stopped) return;
     this.backoff.attempt++;
     const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (this.backoff.attempt - 1));
     const jitter = Math.random() * 500;
-    const delay = Math.max(options.reconnectDelayMs ?? 5000, base + jitter);
+    // "You are already connected to this proxy" — the proxy server still has
+    // our previous session open. Wait significantly longer to let it expire.
+    const proxyAlreadyConnected = /already connected/i.test(reason);
+    const extraDelay = proxyAlreadyConnected ? 30_000 : 0;
+    const delay = Math.max(options.reconnectDelayMs ?? 5000, base + jitter) + extraDelay;
     this.store.patchConnection({ reconnectAttempts: this.backoff.attempt });
-    this.log.warn('connection', `Scheduling reconnect attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s`);
+    this.log.warn('connection', `Scheduling reconnect attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s${proxyAlreadyConnected ? ' (proxy already connected, waiting longer)' : ''}`);
     this.store.patchConnection({ state: 'RECONNECTING' });
     this.emit('snapshot');
     this.backoff.timer = setTimeout(() => {
@@ -184,7 +188,7 @@ export class MinecraftBotManager extends EventEmitter {
       this.store.patchConnection({ state: 'ERROR' });
       this.log.error('auth', `Microsoft auth failed: ${(err as Error).message}`);
       this.emit('snapshot');
-      if (!manual) this.scheduleReconnect(options);
+      if (!manual) this.scheduleReconnect(options, (err as Error).message);
       return;
     }
 
@@ -221,7 +225,7 @@ export class MinecraftBotManager extends EventEmitter {
     } catch (err) {
       this.store.patchConnection({ state: 'ERROR' });
       this.log.error('connection', `Failed to create bot: ${(err as Error).message}`);
-      if (!manual) this.scheduleReconnect(options);
+      if (!manual) this.scheduleReconnect(options, (err as Error).message);
       return;
     }
 
@@ -374,8 +378,13 @@ export class MinecraftBotManager extends EventEmitter {
       this.emit('snapshot');
       return;
     }
+    // "Already connected" from a proxy: don't compound the backoff — reset
+    // attempt counter so we don't wait an hour between retries.
+    if (reason === 'CONFLICTING_CONNECTION') {
+      this.backoff.attempt = 1;
+    }
     if (options.autoReconnect) {
-      this.scheduleReconnect(options);
+      this.scheduleReconnect(options, rawMessage);
     } else {
       this.store.patchConnection({ state: 'OFFLINE' });
       this.emit('snapshot');
@@ -453,6 +462,19 @@ export class MinecraftBotManager extends EventEmitter {
       } catch (err) {
         this.log.warn('connection', `Bot quit error: ${(err as Error).message}`);
       }
+      // Give the proxy server time to fully release our previous session
+      // before a new connection attempt. mc.238458.xyz returns
+      // "You are already connected to this proxy!" if we reconnect too fast.
+      const b = this.bot;
+      this.bot = null;
+      try {
+        await new Promise<void>((resolve) => {
+          let done = false;
+          const finish = () => { if (!done) { done = true; resolve(); } };
+          b.once('end', finish);
+          setTimeout(finish, 4000);
+        });
+      } catch {}
       try {
         this.bot.removeAllListeners();
       } catch (err) {
