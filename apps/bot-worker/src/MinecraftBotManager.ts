@@ -200,6 +200,14 @@ export class MinecraftBotManager extends EventEmitter {
       viewDistance: options.viewDistance,
       auth: options.authMode,
       hideErrors: false,
+      connectTimeout: 60_000,
+      // Render's free tier occasionally drops idle TCP sessions. Aggressive
+      // keep-alives keep the connection healthy and prevent the server from
+      // timing us out after 30s of silence.
+      keepAliveInterval: 5000,
+      closeTimeout: 10_000,
+      // Re-send encrypted handshakes / sessions promptly
+      respawn: true,
     };
     if (token) createOpts.accessToken = token;
     if (options.authMode === 'offline') createOpts.auth = 'offline';
@@ -233,6 +241,7 @@ export class MinecraftBotManager extends EventEmitter {
         pitch: bot.entity.pitch ?? 0,
       });
       await this.startViewer(options);
+      this.startKeepAliveLoop(bot);
       this.emit('snapshot');
     });
 
@@ -250,6 +259,7 @@ export class MinecraftBotManager extends EventEmitter {
           : { x: 0, y: 0, z: 0 },
         onGround: !!bot.entity.onGround,
       });
+      this.lastMoveAt = Date.now();
       this.emit('snapshot');
     });
 
@@ -372,6 +382,40 @@ export class MinecraftBotManager extends EventEmitter {
     }
   }
 
+  private keepAliveTimer: NodeJS.Timeout | null = null;
+  private lastMoveAt = 0;
+
+  /**
+   * Render's free-tier edge aggressively drops idle TCP sessions. Sending a
+   * harmless look-packet every few seconds keeps the socket warm and tells
+   * the Minecraft server the bot is still alive.
+   */
+  private startKeepAliveLoop(bot: any) {
+    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+    this.lastMoveAt = Date.now();
+    this.keepAliveTimer = setInterval(() => {
+      if (!bot || !bot.entity) return;
+      const idle = Date.now() - this.lastMoveAt;
+      if (idle < 10_000) return; // moved recently, no need
+      try {
+        // Re-issue the bot's current look to send a small packet downstream.
+        const yaw = bot.entity.yaw ?? 0;
+        const pitch = bot.entity.pitch ?? 0;
+        bot.look(yaw, pitch, true);
+      } catch (err) {
+        this.log.debug('connection', `keepAlive look failed: ${(err as Error).message}`);
+      }
+    }, 7_000);
+    this.keepAliveTimer.unref?.();
+  }
+
+  private stopKeepAliveLoop() {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+  }
+
   private async startViewer(options: ConnectOptions): Promise<void> {
     if (!options.viewDistance || options.viewDistance <= 0) {
       this.store.patchViewer({ renderDistance: 0, ready: false });
@@ -393,6 +437,7 @@ export class MinecraftBotManager extends EventEmitter {
   }
 
   async destroyBot(reason: string): Promise<void> {
+    this.stopKeepAliveLoop();
     if (this.viewCleanup) {
       try {
         await this.viewCleanup();
