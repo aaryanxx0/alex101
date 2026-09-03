@@ -85,6 +85,23 @@ app.post('/auth/token', (req: Request, res: Response) => {
     res.json(bot.snapshot());
   });
 
+  app.get('/debug/last-disconnect', (req: Request, res: Response) => {
+    const provided = req.headers['x-bot-worker-secret'];
+    if (typeof provided !== 'string' || provided !== SECRET) {
+      res.status(401).json({ error: 'invalid shared secret' });
+      return;
+    }
+    const conn = store.get().connection;
+    res.json({
+      state: conn.state,
+      lastDisconnect: conn.lastDisconnect,
+      lastDisconnectMessage: conn.lastDisconnectMessage,
+      lastDisconnectAt: conn.lastDisconnectAt,
+      reconnectAttempts: conn.reconnectAttempts,
+      recentLogs: log.recent().slice(-30),
+    });
+  });
+
   // Catch-all error handler
   app.use((err: Error, _req: Request, res: Response, _next: any) => {
     log.error('http', err.message);
