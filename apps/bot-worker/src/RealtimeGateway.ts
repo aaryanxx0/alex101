@@ -181,7 +181,7 @@ export class RealtimeGateway {
         return;
       }
       case 'heartbeat': {
-        if (client.controllerId === msg.controllerId) {
+        if (client.controllerId === msg.controllerId && client.controllerId) {
           this.deps.control.heartbeat(client.controllerId);
         }
         return;
