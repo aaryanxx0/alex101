@@ -113,7 +113,11 @@ app.post('/auth/token', (req: Request, res: Response) => {
 
   const gateway = new RealtimeGateway({ log, store, config, bot, control, pathfinder, viewerBaseUrl: () => viewer.baseUrl() });
   gateway.setTokenIssuer(issuer);
-  if (DASHBOARD_ORIGIN) gateway.allowOrigin(DASHBOARD_ORIGIN);
+  if (DASHBOARD_ORIGIN) {
+    for (const origin of DASHBOARD_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)) {
+      gateway.allowOrigin(origin);
+    }
+  }
   gateway.allowOrigin('null'); // file:// debug
   gateway.start(wss);
 
