@@ -89,6 +89,8 @@ export class MinecraftBotManager extends EventEmitter {
   private disconnectHandled = false;
   /** Guards concurrent connect() calls while a connection attempt is in flight. */
   private connecting = false;
+  /** Idempotent bot-ready latch (mineflayer spawn OR first play position packet). */
+  private readyDone = false;
   /** Per-connection session id (mc-1, mc-2, ...) so logs never mix attempts. */
   private sessionCounter = 0;
   private sessionId = 'mc-0';
@@ -148,6 +150,7 @@ export class MinecraftBotManager extends EventEmitter {
     }
     this.connecting = true;
     this.disconnectHandled = false;
+    this.readyDone = false;
     this.resetAuthSession();
     this.backoff.stopped = false;
     // Password priority: 1) explicitly saved protected setting (worker config
@@ -327,14 +330,21 @@ export class MinecraftBotManager extends EventEmitter {
     this.packetRing = [];
     this.keepAliveIn = 0;
     this.keepAliveOut = 0;
-    const INTEREST = /^(open_sign_editor|open_window|open_screen|open_horse_window|block_entity_data|block_update|block_action|update_sign|sign_update|open_book|close_window|close_container|custom_payload|client_command|disconnect|kick_disconnect|chat_command|chat_message|server_links|cookie_request|store_cookie|select_known_packs|feature_flags|registry_data|keep_alive|position|teleport|login|success|set_compression)$/i;
+    // Payloads are logged for low-frequency protocol events only. High-rate
+    // packets (position/entity/keepalive) stay out so the log ring isn't flooded.
+    const INTEREST = /^(open_sign_editor|open_window|open_screen|block_entity_data|block_update|block_action|update_sign|open_book|close_window|close_container|custom_payload|client_command|disconnect|kick_disconnect|chat_command|chat_message|select_known_packs|feature_flags|registry_data|login|success|set_compression)$/i;
     const trace = (dir: 'IN' | 'OUT', name: string, state: string, data?: any) => {
       const entry = `${new Date().toISOString()} ${dir} ${state}/${name}`;
       this.packetRing.push(entry);
       if (this.packetRing.length > 200) this.packetRing.shift();
       if (/keep_alive/i.test(name)) {
         if (dir === 'IN') this.keepAliveIn++; else this.keepAliveOut++;
-        this.log.info('packet', `KEEPALIVE_${dir} session=${this.sessionId} (in=${this.keepAliveIn} out=${this.keepAliveOut})`);
+      }
+      // Mineflayer 4.38.0 does not always emit its own 'spawn' on newer
+      // protocols (774). The first play-state position packet IS the spawn
+      // signal — trigger the same idempotent ready path.
+      if (dir === 'IN' && name === 'position' && state === 'play') {
+        this.markBotReady(bot, options);
       }
       if (INTEREST.test(name)) {
         let detail = '';
@@ -356,32 +366,8 @@ export class MinecraftBotManager extends EventEmitter {
     }
 
     bot.once('spawn', async () => {
-      this.timeline.spawn = Date.now();
-      this.log.success('connection', `SPAWN session=${this.sessionId} (${this.timeline.spawn - this.timeline.create}ms after CREATE_BOT)`);
-      this.store.patchConnection({ state: 'SPAWNED', actualUsername: bot.username ?? actualUsername });
-      this.store.patchConnection({ serverVersion: bot.version ?? null });
-      this.log.success('connection', `Spawned as ${bot.username} on version ${bot.version}`);
-      this.store.patchPosition({
-        x: bot.entity.position.x,
-        y: bot.entity.position.y,
-        z: bot.entity.position.z,
-        yaw: bot.entity.yaw ?? 0,
-        pitch: bot.entity.pitch ?? 0,
-      });
-      await this.startViewer(options);
-      this.startKeepAliveLoop(bot);
-      // Immediately nudge the bot so the proxy sees fresh position packets.
-      try {
-        bot.setControlState('jump', true);
-        setTimeout(() => bot.setControlState('jump', false), 200);
-        this.lastMoveAt = Date.now();
-      } catch (err) {
-        this.log.debug('connection', `post-spawn nudge failed: ${(err as Error).message}`);
-      }
-      // AuthMe state machine: wait for the server's prompt, classify it, then
-      // send exactly ONE appropriate command. Never blind-fire /login on spawn.
-      this.startAuthFlow(bot, options);
-      this.emit('snapshot');
+      this.log.info('connection', `SPAWN event (mineflayer) session=${this.sessionId}`);
+      await this.markBotReady(bot, options);
     });
 
     // Raw message preservation (Phase 2): log raw JSON + plain text.
@@ -791,6 +777,41 @@ export class MinecraftBotManager extends EventEmitter {
       clearInterval(this.positionWatchdog);
       this.positionWatchdog = null;
     }
+  }
+
+  /**
+   * Idempotent "bot is in the world" path — driven by mineflayer's spawn event
+   * OR the first play-state position packet (mineflayer 4.38.0 doesn't always
+   * emit spawn on newer protocols like 774).
+   */
+  private async markBotReady(bot: any, options: ConnectOptions) {
+    if (this.readyDone) return;
+    this.readyDone = true;
+    this.timeline.spawn = Date.now();
+    this.log.success('connection', `SPAWN session=${this.sessionId} (${this.timeline.spawn - this.timeline.create}ms after CREATE_BOT, position=${bot.entity ? `${bot.entity.position.x.toFixed(1)},${bot.entity.position.y.toFixed(1)},${bot.entity.position.z.toFixed(1)}` : 'n/a'})`);
+    this.store.patchConnection({ state: 'SPAWNED', actualUsername: bot.username ?? options.username });
+    this.store.patchConnection({ serverVersion: bot.version ?? null });
+    this.store.patchPosition({
+      x: bot.entity?.position?.x ?? 0,
+      y: bot.entity?.position?.y ?? 0,
+      z: bot.entity?.position?.z ?? 0,
+      yaw: bot.entity?.yaw ?? 0,
+      pitch: bot.entity?.pitch ?? 0,
+    });
+    await this.startViewer(options);
+    this.startKeepAliveLoop(bot);
+    // Immediately nudge the bot so the proxy sees fresh position packets.
+    try {
+      bot.setControlState('jump', true);
+      setTimeout(() => bot.setControlState('jump', false), 200);
+      this.lastMoveAt = Date.now();
+    } catch (err) {
+      this.log.debug('connection', `post-spawn nudge failed: ${(err as Error).message}`);
+    }
+    // AuthMe state machine: wait for the server's prompt, classify it, then
+    // send exactly ONE appropriate command. Never blind-fire /login on spawn.
+    this.startAuthFlow(bot, options);
+    this.emit('snapshot');
   }
 
   private async startViewer(options: ConnectOptions): Promise<void> {
