@@ -10,6 +10,7 @@ export function StatusPanel({ snapshot }: { snapshot: BotSnapshot | null }) {
       <h3>Status</h3>
       <div className="col" style={{ gap: 6 }}>
         <div className="row"><span className="muted" style={{ width: 110 }}>State</span><strong>{c.state}</strong></div>
+        <div className="row"><span className="muted" style={{ width: 110 }}>Server auth</span><strong style={{ color: c.authState === 'AUTHENTICATED' ? 'var(--good)' : c.authState && c.authState !== 'AUTHENTICATED' && c.state === 'SPAWNED' ? 'var(--warn)' : undefined }}>{c.authState ?? '—'}</strong></div>
         <div className="row"><span className="muted" style={{ width: 110 }}>Host</span><span>{c.host}:{c.port}</span></div>
         <div className="row"><span className="muted" style={{ width: 110 }}>MC version</span><span>{c.minecraftVersion}{c.serverVersion ? ` / ${c.serverVersion}` : ''}</span></div>
         <div className="row"><span className="muted" style={{ width: 110 }}>Username</span><span>{c.actualUsername ?? c.configuredUsername}</span></div>

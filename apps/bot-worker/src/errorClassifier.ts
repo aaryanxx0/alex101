@@ -15,7 +15,7 @@ export function classifyError(rawMessage: string, code?: string): DisconnectReas
 
   if (/whitelist|not on the whitelist|you are not on/i.test(msg)) return 'WHITELIST_REJECTION';
   if (/server is full|full/i.test(msg) && /server/i.test(msg)) return 'SERVER_FULL';
-  if (/already connected/i.test(msg)) return 'CONFLICTING_CONNECTION';
+  if (/already connected|duplicate login|you are already connected/i.test(msg)) return 'CONFLICTING_CONNECTION';
   if (/banned/i.test(msg)) return 'BANNED';
   if (/outdated|incompatible protocol/i.test(msg)) return 'UNSUPPORTED_PROTOCOL';
   if (/invalid session|session.*invalid/i.test(msg)) return 'INVALID_SESSION';

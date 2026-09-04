@@ -31,9 +31,15 @@ const RING_CAPACITY = 1000;
 export class LogManager {
   private readonly ring: LogEntry[] = [];
   private readonly listeners = new Set<LogSinkListener>();
+  private prefix = '';
+
+  /** Set the worker instance id prefix (proves which instance produced a log). */
+  setPrefix(prefix: string) {
+    this.prefix = prefix;
+  }
 
   log(level: LogLevel, category: string, message: string, meta?: Record<string, unknown>): LogEntry {
-    const safeMessage = redact(message);
+    const safeMessage = this.prefix ? `[${this.prefix}] ${redact(message)}` : redact(message);
     const safeMeta = redactMeta(meta);
     const entry: LogEntry = {
       id: makeId('log'),

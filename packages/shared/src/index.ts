@@ -10,7 +10,8 @@ export type ConnectionState =
   | 'SPAWNED'
   | 'RECONNECTING'
   | 'DISCONNECTING'
-  | 'ERROR';
+  | 'ERROR'
+  | 'CONNECTION_CONFLICT';
 
 /**
  * Normalized disconnect categories the dashboard can render with friendly text.
@@ -71,6 +72,8 @@ export interface ConnectionInfo {
   uptimeMs: number;
   /** True when an AuthMe password is configured (value never exposed). */
   authPasswordSet?: boolean;
+  /** In-game (EasyAuth/AuthMe) auth state — separate from protocol state. */
+  authState?: string;
 }
 
 export interface Vec3 {

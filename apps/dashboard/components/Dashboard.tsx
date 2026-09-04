@@ -578,6 +578,7 @@ function dotClass(state?: string): string {
     case 'SPAWNED':
       return 'connected';
     case 'ERROR':
+    case 'CONNECTION_CONFLICT':
       return 'error';
     default: return 'off';
   }

@@ -561,10 +561,24 @@ export class MinecraftBotManager extends EventEmitter {
       this.emit('snapshot');
       return;
     }
-    // "Already connected" or "keepAliveError" from a proxy: don't compound
-    // the backoff — reset attempt counter so we don't wait an hour between
-    // retries.
-    if (reason === 'CONFLICTING_CONNECTION' || /keepalive|client timed out/i.test(reason)) {
+    // Proxy/server says another Alex101 session is active. Retrying can never
+    // succeed until the stale session is cleared — STOP, no auto-reconnect.
+    if (reason === 'CONFLICTING_CONNECTION') {
+      this.log.error('connection', `CONNECTION_CONFLICT session=${this.sessionId} — "You are already connected to this proxy!" A stale/duplicate Alex101 session exists. Auto-reconnect STOPPED. Clear the session (wait, or ask the server owner), then START BOT.`);
+      this.backoff.stopped = true;
+      if (this.backoff.timer) { clearTimeout(this.backoff.timer); this.backoff.timer = null; }
+      this.backoff.attempt = 0;
+      this.store.patchConnection({
+        state: 'CONNECTION_CONFLICT',
+        lastDisconnect: 'CONFLICTING_CONNECTION',
+        lastDisconnectMessage: 'Alex101 is already connected to the server/proxy. Stop the existing session or ask the server owner to clear the stale connection, then press START BOT.',
+      });
+      this.emit('snapshot');
+      return;
+    }
+    // "keepAliveError" from a proxy: don't compound the backoff — reset
+    // attempt counter so we don't wait an hour between retries.
+    if (/keepalive|client timed out/i.test(reason)) {
       this.backoff.attempt = 1;
     }
     if (options.autoReconnect) {
@@ -591,6 +605,8 @@ export class MinecraftBotManager extends EventEmitter {
   private lastAuthCommand: string | null = null;
   private lastAuthCommandAt = 0;
   private authAttemptCount = 0;
+  private authRegisterCount = 0;
+  private authLoginCount = 0;
   private static readonly AUTH_TIMEOUT_MS = 45_000;
   private static readonly AUTH_COMMAND_COOLDOWN_MS = 6_000;
   private static readonly MAX_AUTH_ATTEMPTS = 3;
@@ -601,21 +617,26 @@ export class MinecraftBotManager extends EventEmitter {
     this.lastAuthCommand = null;
     this.lastAuthCommandAt = 0;
     this.authAttemptCount = 0;
+    this.authRegisterCount = 0;
+    this.authLoginCount = 0;
+  }
+
+  /** Persist the in-game auth state (visible separately in the dashboard). */
+  private setAuthState(next: string) {
+    if (this.authState === next) return; // no duplicate state-change logs
+    this.authState = next;
+    this.store.patchConnection({ authState: next });
   }
 
   /** Called on SPAWN. Waits for the server's AuthMe prompt — never blind-fires. */
   private startAuthFlow(bot: any, options: ConnectOptions) {
     this.resetAuthSession();
-    this.authState = 'WAITING_FOR_PROMPT';
+    this.setAuthState('WAITING_FOR_PROMPT');
     this.log.info('auth', `AUTH_STATE_CHANGE → WAITING_FOR_PROMPT session=${this.sessionId} (password source: ${options.authPassword ? 'configured' : 'MISSING'})`);
-    if (!options.authPassword) {
-      this.log.warn('auth', `AUTH_MISSING_PASSWORD session=${this.sessionId} — server may kick the bot if it requires AuthMe login. Set the in-game password in the dashboard or BOT_PASSWORD env.`);
-      return;
-    }
     // Single authentication timeout. Reset/cancelled by AUTHENTICATED or failure.
     this.authTimer = setTimeout(() => {
-      if (this.authState !== 'AUTHENTICATED' && this.authState !== 'AUTH_FAILED') {
-        this.authState = 'AUTH_TIMEOUT';
+      if (this.authState !== 'AUTHENTICATED' && this.authState !== 'AUTH_FAILED' && this.authState !== 'AUTH_PASSWORD_REQUIRED') {
+        this.setAuthState('AUTH_TIMEOUT');
         this.log.error('auth', `AUTH_STATE_CHANGE → AUTH_TIMEOUT session=${this.sessionId} after ${MinecraftBotManager.AUTH_TIMEOUT_MS}ms without authentication success. Stopping (no reconnect).`);
         this.authTimer = null;
         this.emit('snapshot');
@@ -624,12 +645,32 @@ export class MinecraftBotManager extends EventEmitter {
     this.authTimer.unref?.();
   }
 
+  /** Missing password + server demands auth → clean stop, no reconnect loop. */
+  private stopForMissingPassword(text: string) {
+    this.setAuthState('AUTH_PASSWORD_REQUIRED');
+    if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+    this.backoff.stopped = true;
+    this.log.error('auth', `AUTH_PASSWORD_REQUIRED session=${this.sessionId} — server demands authentication but BOT_PASSWORD is not configured. Disconnecting cleanly (no reconnect loop). Set the password in Dashboard → Settings → "Minecraft server / AuthMe password", then START BOT.`);
+    this.store.patchConnection({
+      state: 'ERROR',
+      lastDisconnect: 'AUTH_REQUIRED',
+      lastDisconnectMessage: 'Alex101 requires an in-game server password. Open Settings → Minecraft server / AuthMe password, save it, then press START BOT.',
+    });
+    this.emit('snapshot');
+    void this.destroyBot('auth password required', 'stopForMissingPassword').then(() => {
+      this.store.resetRuntime();
+      this.store.patchConnection({ state: 'OFFLINE' });
+      this.emit('snapshot');
+    });
+  }
+
   /**
-   * The single controller for AuthMe. Classifies the prompt and sends at most
-   * ONE command per prompt, with cooldown + attempt cap.
+   * The single controller for EasyAuth/AuthMe. Classifies the prompt and sends
+   * at most ONE command per type (register = exactly 1 per session, login ≤ 3),
+   * with a cooldown so repeated server prompts never spam commands.
    */
   private handleChatForAuth(bot: any, text: string) {
-    if (this.authState === 'AUTHENTICATED' || this.authState === 'AUTH_FAILED') return;
+    if (this.authState === 'AUTHENTICATED' || this.authState === 'AUTH_FAILED' || this.authState === 'AUTH_PASSWORD_REQUIRED') return;
     if (!text) return;
     const t = text.toLowerCase();
     if (this.timeline.firstAuthMsg === 0 && /(login|register|authenticat)/.test(t)) {
@@ -637,51 +678,61 @@ export class MinecraftBotManager extends EventEmitter {
       this.log.info('auth', `AUTH_MESSAGE_RECEIVED session=${this.sessionId} (${this.timeline.spawn ? `${this.timeline.firstAuthMsg - this.timeline.spawn}ms after SPAWN` : 'pre-spawn'}) raw="${text.slice(0, 200)}"`);
     }
 
-    // Success (Phase 7)
-    if (/you are now authenticated|successfully logged in|login successful|logged in successfully|you are now logged in/.test(t)) {
+    // Success (register success also counts — EasyAuth usually auto-logs-in)
+    if (/you are now authenticated|successfully logged in|login successful|logged in successfully|you are now logged in|successfully registered|registration successful|account registered/.test(t)) {
       if (this.authState !== 'AUTHENTICATED') {
-        this.authState = 'AUTHENTICATED';
+        const wasRegister = /register/i.test(t);
+        this.setAuthState('AUTHENTICATED');
         if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+        if (wasRegister) this.log.success('auth', `REGISTER_SUCCESS session=${this.sessionId} raw="${text.slice(0, 200)}"`);
         this.log.success('auth', `AUTHENTICATED_CONFIRMED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
         this.emit('snapshot');
       }
       return;
     }
 
-    // Incorrect password (Phase 6) — critical, hard stop.
-    if (/incorrect password|wrong password/.test(t)) {
-      this.authState = 'AUTH_FAILED';
+    // Incorrect password — critical, hard stop (never hammer the same password).
+    if (/incorrect password|wrong password|invalid password/.test(t)) {
+      this.setAuthState('AUTH_FAILED');
       if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
       this.backoff.stopped = true; // never retry the same wrong password
-      this.log.error('auth', `AUTH_STATE_CHANGE → AUTH_FAILED session=${this.sessionId} server said: "${text.slice(0, 200)}". AuthMe rejected the configured password. Auto-reconnect STOPPED — update the password and press START BOT.`);
-      this.store.patchConnection({ state: 'ERROR', lastDisconnect: 'AUTH_REQUIRED', lastDisconnectMessage: `AuthMe rejected the password: ${text.slice(0, 200)}` });
+      this.log.error('auth', `AUTH_STATE_CHANGE → AUTH_FAILED session=${this.sessionId} server said: "${text.slice(0, 200)}". Server authentication rejected BOT_PASSWORD for Alex101. Auto-reconnect STOPPED — update the password and press START BOT.`);
+      this.store.patchConnection({ state: 'ERROR', lastDisconnect: 'AUTH_REQUIRED', lastDisconnectMessage: 'Server authentication rejected BOT_PASSWORD for Alex101. Update the password in Settings, then START BOT.' });
       this.emit('snapshot');
       return;
     }
 
-    // Registration explicitly requested (Phase 4)
+    // Registration explicitly requested
     if (/not registered|register (with|using)|use \/register/.test(t) && /register/.test(t)) {
-      this.authState = 'REGISTER_REQUIRED';
-      this.log.info('auth', `AUTH_STATE_CHANGE → REGISTER_REQUIRED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
+      this.setAuthState('REGISTER_REQUIRED');
+      if (!this.currentAuthPassword) {
+        this.stopForMissingPassword(text);
+        return;
+      }
       this.sendAuthCommand(bot, 'register');
       return;
     }
 
-    // Login requested (Phase 4)
+    // Login requested
     if (/not authenticated|not logged in|please (log ?in|authenticate)|use \/login|use \/l\b|log ?in to authenticate|authentication timeout/.test(t)) {
-      this.authState = 'LOGIN_REQUIRED';
-      this.log.info('auth', `AUTH_STATE_CHANGE → LOGIN_REQUIRED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
-      this.sendAuthCommand(bot, 'login', undefined as any);
+      this.setAuthState('LOGIN_REQUIRED');
+      if (!this.currentAuthPassword) {
+        this.stopForMissingPassword(text);
+        return;
+      }
+      this.sendAuthCommand(bot, 'login');
       return;
     }
   }
 
-  /** Cooldown + attempt-capped single-command sender. */
-  private sendAuthCommand(bot: any, type: 'login' | 'register', _unused?: any) {
+  /** Cooldown + per-type attempt-capped single-command sender. */
+  private sendAuthCommand(bot: any, type: 'login' | 'register') {
     const pw = this.currentAuthPassword;
     if (!pw) { this.log.warn('auth', `AUTH_COMMAND_SKIPPED type=${type} session=${this.sessionId} — no password configured`); return; }
-    if (this.authAttemptCount >= MinecraftBotManager.MAX_AUTH_ATTEMPTS) {
-      this.log.error('auth', `AUTH_COMMAND_SKIPPED type=${type} session=${this.sessionId} — attempt cap (${MinecraftBotManager.MAX_AUTH_ATTEMPTS}) reached`);
+    const typeCap = type === 'register' ? 1 : 3; // register EXACTLY once per session
+    const typeCount = type === 'register' ? this.authRegisterCount : this.authLoginCount;
+    if (typeCount >= typeCap) {
+      this.log.info('auth', `AUTH_COMMAND_SUPPRESSED type=${type} session=${this.sessionId} — already sent ${typeCount}× this session, waiting for server response`);
       return;
     }
     const since = Date.now() - this.lastAuthCommandAt;
@@ -691,11 +742,12 @@ export class MinecraftBotManager extends EventEmitter {
     }
     const cmd = type === 'login' ? `/login ${pw}` : `/register ${pw} ${pw}`;
     this.authAttemptCount++;
+    if (type === 'register') this.authRegisterCount++; else this.authLoginCount++;
     this.lastAuthCommand = type;
     this.lastAuthCommandAt = Date.now();
     this.timeline.authSent = Date.now();
-    this.authState = type === 'login' ? 'LOGIN_SENT' : 'REGISTER_SENT';
-    this.log.info('auth', `AUTH_COMMAND_SENT session=${this.sessionId} type=${type} attempt=${this.authAttemptCount} ts=${new Date().toISOString()} (contents redacted)`);
+    this.setAuthState(type === 'login' ? 'LOGIN_SENT' : 'REGISTER_SENT');
+    this.log.info('auth', `AUTH_COMMAND_SENT session=${this.sessionId} type=${type} count=${type === 'register' ? this.authRegisterCount : this.authLoginCount} ts=${new Date().toISOString()} (contents redacted)`);
     try {
       bot.chat(cmd);
     } catch (err) {
@@ -705,7 +757,7 @@ export class MinecraftBotManager extends EventEmitter {
     if (type === 'register') {
       setTimeout(() => {
         if (this.authState === 'REGISTER_SENT' || this.authState === 'REGISTER_REQUIRED') {
-          this.authState = 'LOGIN_REQUIRED';
+          this.setAuthState('LOGIN_REQUIRED');
           this.sendAuthCommand(bot, 'login');
         }
       }, 2000);

@@ -32,7 +32,10 @@ if (!SECRET) {
 }
 
 async function main() {
+  const WORKER_INSTANCE_ID = `w-${Math.random().toString(16).slice(2, 6)}`;
   const log = new LogManager();
+  log.setPrefix(WORKER_INSTANCE_ID);
+  log.info('worker', `Worker instance starting id=${WORKER_INSTANCE_ID} pid=${process.pid} AUTO_CONNECT=${process.env.AUTO_CONNECT ?? '1'}`);
   const config = new ConfigManager(process.env.BOT_WORKER_CONFIG || './data/settings.json');
   const store = new BotStateStore();
   const auth = new AuthManager(log);
