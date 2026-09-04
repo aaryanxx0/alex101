@@ -118,7 +118,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       const tokenData = await tokenRes.json();
       tokenRef.current = tokenData.token;
       setDiagToken('OK');
-      setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer');
+      setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer/');
 
       const wsUrl = workerUrl.replace(/^http/, 'ws') + '/ws';
       const ws = new WebSocket(wsUrl);
@@ -159,7 +159,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
             setChat((c) => [...c, msg.message].slice(-200));
             break;
           case 'viewer-status':
-            setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer');
+            setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer/');
             break;
           case 'control-status':
             if (msg.status === 'CONTROL_GRANTED') pushToast('success', 'Control granted — this browser owns Alex101.');
