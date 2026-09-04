@@ -31,6 +31,19 @@ import {
 
 type Tab = 'play' | 'navigation' | 'players' | 'inventory' | 'chat' | 'logs' | 'settings';
 
+type ToastKind = 'error' | 'success' | 'info' | 'warning';
+
+interface ToastItem {
+  id: number;
+  kind: ToastKind;
+  text: string;
+  leaving?: boolean;
+}
+
+const TOAST_VISIBLE_MS = 4600;
+const TOAST_LEAVE_MS = 450;
+const TOAST_DEDUPE_MS = 12000;
+
 interface DashboardProps {
   workerUrl: string;
 }
@@ -45,7 +58,26 @@ export function Dashboard({ workerUrl }: DashboardProps) {
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
   const [pointerLock, setPointerLock] = useState(false);
   const [isController, setIsController] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const lastToastRef = useRef<{ text: string; ts: number } | null>(null);
+
+  /** Push a toast: slide in, visible ~5s, slide out, removed from DOM. Deduped. */
+  const pushToast = useCallback((kind: ToastKind, text: string) => {
+    const now = Date.now();
+    if (lastToastRef.current && lastToastRef.current.text === text && now - lastToastRef.current.ts < TOAST_DEDUPE_MS) return;
+    lastToastRef.current = { text, ts: now };
+    const id = now + Math.floor(Math.random() * 1000);
+    setToasts((t) => [...t.slice(-3), { id, kind, text }]);
+    setTimeout(() => {
+      setToasts((t) => t.map((x) => (x.id === id ? { ...x, leaving: true } : x)));
+      setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), TOAST_LEAVE_MS);
+    }, TOAST_VISIBLE_MS);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((t) => t.map((x) => (x.id === id ? { ...x, leaving: true } : x)));
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), TOAST_LEAVE_MS);
+  }, []);
 
   // ---- Diagnostics (visible with ?debug=1 or localStorage.alex101_debug=1) ----
   const [dbg] = useState(() => {
@@ -129,15 +161,15 @@ export function Dashboard({ workerUrl }: DashboardProps) {
             setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer');
             break;
           case 'control-status':
-            if (msg.status === 'CONTROL_GRANTED') setStatusMessage('Control granted — this browser owns Alex101.');
-            else if (msg.status === 'CONTROL_DENIED') setStatusMessage(msg.message || 'Alex101 is controlled by another session.');
-            else setStatusMessage(`Control: ${msg.status}${msg.message ? ` — ${msg.message}` : ''}`);
+            if (msg.status === 'CONTROL_GRANTED') pushToast('success', 'Control granted — this browser owns Alex101.');
+            else if (msg.status === 'CONTROL_DENIED') pushToast('warning', msg.message || 'Alex101 is controlled by another session.');
+            else pushToast('warning', `Control: ${msg.status}${msg.message ? ` — ${msg.message}` : ''}`);
             break;
           case 'error':
-            setStatusMessage(`${msg.code}: ${msg.message}`);
+            pushToast('error', `${msg.code}: ${msg.message}`);
             break;
           case 'kicked':
-            setStatusMessage(`Kicked: ${msg.reason} — ${msg.raw}`);
+            pushToast('error', `Kicked: ${msg.reason} — ${msg.raw}`);
             break;
         }
       };
@@ -323,7 +355,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
   const onRequestControl = () => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN || !tokenRef.current) {
-      setStatusMessage('CONTROL_WS_OFFLINE — realtime connection to the worker is not available.');
+      pushToast('warning', 'CONTROL_WS_OFFLINE — realtime connection to the worker is not available.');
       return;
     }
     sendCommand({ type: 'request-control', take: otherController });
@@ -341,6 +373,17 @@ export function Dashboard({ workerUrl }: DashboardProps) {
     if (r === 'NONE') return null;
     return `${r}`;
   }, [snapshot?.connection.lastDisconnect]);
+
+  // Toast triggers — pushed once per state change, auto-dismissed by the stack.
+  useEffect(() => {
+    if (authError) pushToast('error', authError);
+  }, [authError, pushToast]);
+  useEffect(() => {
+    if (lastDisconnectFriendly) {
+      pushToast('error', `Last disconnect: ${lastDisconnectFriendly}${snapshot?.connection.lastDisconnectMessage ? ` — ${snapshot.connection.lastDisconnectMessage}` : ''}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastDisconnectFriendly]);
 
   return (
     <div className="app-root">
@@ -372,13 +415,14 @@ export function Dashboard({ workerUrl }: DashboardProps) {
         </div>
       </header>
 
-      {authError && <div className="toast error">{authError}</div>}
-      {statusMessage && <div className="toast" style={{ background: 'var(--panel, #222)' }}>{statusMessage}</div>}
-      {lastDisconnectFriendly && (
-        <div className="toast error" style={{ left: 16, right: 'auto' }}>
-          Last disconnect: {lastDisconnectFriendly} — {snapshot?.connection.lastDisconnectMessage}
-        </div>
-      )}
+      <div className="toast-stack" role="status" aria-live="polite">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast-item ${t.kind}${t.leaving ? ' leaving' : ''}`}>
+            <span>{t.text}</span>
+            <button className="toast-close" aria-label="Dismiss" onClick={() => dismissToast(t.id)}>×</button>
+          </div>
+        ))}
+      </div>
       {dbg && (
         <div style={{ position: 'fixed', bottom: 8, right: 8, zIndex: 9999, fontSize: 11, fontFamily: 'monospace', background: 'rgba(0,0,0,.85)', color: '#9f9', padding: '6px 10px', borderRadius: 6 }}>
           HTTP: OK · TOKEN: {diagToken} · WS: {diagWs} · SNAPSHOT: {diagSnapshot} · CONTROL: {isController ? 'OWNED_BY_THIS_BROWSER' : otherController ? 'OWNED_BY_OTHER' : 'NONE'}
