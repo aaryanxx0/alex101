@@ -88,6 +88,11 @@ export class MinecraftBotManager extends EventEmitter {
   private disconnectHandled = false;
   /** Guards concurrent connect() calls while a connection attempt is in flight. */
   private connecting = false;
+  /** Per-connection session id (mc-1, mc-2, ...) so logs never mix attempts. */
+  private sessionCounter = 0;
+  private sessionId = 'mc-0';
+  /** Millisecond timeline for the current session (Phase 14 correlation). */
+  private timeline: { create: number; spawn: number; firstAuthMsg: number; authSent: number; end: number } = { create: 0, spawn: 0, firstAuthMsg: 0, authSent: 0, end: 0 };
 
   constructor(
     private readonly log: LogManager,
@@ -115,27 +120,47 @@ export class MinecraftBotManager extends EventEmitter {
   }
 
   async connect(options: ConnectOptions, requestId?: string): Promise<void> {
-    this.log.info('connection', `CONNECT_REQUEST received (requestId=${requestId ?? 'n/a'}, host=${options.host}:${options.port}, user=${options.username}, autoReconnect=${options.autoReconnect}, password=${options.authPassword ? 'set' : 'NOT SET'})`);
+    this.sessionCounter++;
+    this.sessionId = `mc-${this.sessionCounter}`;
+    this.timeline = { create: 0, spawn: 0, firstAuthMsg: 0, authSent: 0, end: 0 };
+    this.log.info('connection', `CONNECT_REQUEST session=${this.sessionId} requestId=${requestId ?? 'n/a'} host=${options.host}:${options.port} user=${options.username} autoReconnect=${options.autoReconnect}`);
     if (this.connecting) {
-      this.log.warn('connection', 'Connect requested while a connection attempt is already in flight — ignoring (idempotent)');
+      this.log.warn('connection', `Connect requested while a connection attempt is already in flight session=${this.sessionId} — ignoring (idempotent)`);
       return;
     }
     if (this.bot) {
-      this.log.warn('connection', 'Connect requested while already connected — ignoring (idempotent)');
+      this.log.warn('connection', `Connect requested while already connected session=${this.sessionId} — ignoring (idempotent)`);
       return;
+    }
+    // A manual START BOT cancels any scheduled reconnect so exactly one
+    // attempt runs (reconnect logic itself is unchanged).
+    if (this.backoff.timer) {
+      clearTimeout(this.backoff.timer);
+      this.backoff.timer = null;
+      this.backoff.attempt = 0;
+      this.log.info('connection', `Cancelled pending reconnect timer session=${this.sessionId} (manual start)`);
     }
     this.connecting = true;
     this.disconnectHandled = false;
+    this.resetAuthSession();
     this.backoff.stopped = false;
-    // Fall back to the protected BOT_PASSWORD env var when no dashboard
-    // password is configured. Never logged.
+    // Password priority: 1) explicitly saved protected setting (worker config
+    // or freshly typed in the dashboard), 2) BOT_PASSWORD env, 3) none.
+    // NEVER any dashboard/JWT/worker secret.
+    const savedPassword = this.config.get().authPassword || '';
+    const resolvedPassword = options.authPassword || savedPassword || process.env.BOT_PASSWORD || '';
+    const pwSource: 'dashboard' | 'dashboard(saved)' | 'environment' | 'missing' = options.authPassword
+      ? 'dashboard'
+      : savedPassword
+        ? 'dashboard(saved)'
+        : (process.env.BOT_PASSWORD ? 'environment' : 'missing');
+    const pwLen = resolvedPassword.length;
     const effectiveOptions: ConnectOptions = {
       ...options,
-      authPassword: options.authPassword || process.env.BOT_PASSWORD || '',
+      authPassword: resolvedPassword,
     };
-    if (!effectiveOptions.authPassword) {
-      this.log.warn('auth', 'No in-game password available (neither dashboard setting nor BOT_PASSWORD env) — AuthMe-protected servers will kick the bot');
-    }
+    this.log.info('auth', `AUTH_PASSWORD_SOURCE=${pwSource} AUTH_PASSWORD_LENGTH=${pwLen} session=${this.sessionId}`);
+    this.currentAuthPassword = effectiveOptions.authPassword ?? '';
     this.store.patchConnection({
       host: effectiveOptions.host,
       port: effectiveOptions.port,
@@ -143,6 +168,7 @@ export class MinecraftBotManager extends EventEmitter {
       minecraftVersion: effectiveOptions.version,
       authMode: effectiveOptions.authMode,
       autoReconnect: effectiveOptions.autoReconnect,
+      authPasswordSet: pwSource !== 'missing',
     });
     this.store.patchViewer({ renderDistance: effectiveOptions.viewDistance, ready: false });
     this.config.update({
@@ -165,13 +191,14 @@ export class MinecraftBotManager extends EventEmitter {
 
   async disconnect(reason = 'manual'): Promise<void> {
     this.backoff.stopped = true;
+    this.log.info('connection', `STOP BOT requested — manualDisconnect=true session=${this.sessionId} reason=${reason}`);
     if (this.backoff.timer) {
       clearTimeout(this.backoff.timer);
       this.backoff.timer = null;
     }
     this.control.releaseAllMovement();
     this.pathfinder.cancel('manual disconnect');
-    await this.destroyBot(`disconnect (${reason})`);
+    await this.destroyBot(`disconnect (${reason})`, 'disconnect()');
     this.store.patchConnection({ state: 'OFFLINE' });
     this.store.resetRuntime();
     this.emit('snapshot');
@@ -260,7 +287,8 @@ export class MinecraftBotManager extends EventEmitter {
 
     const mineflayer = await import('mineflayer');
     let bot: any;
-    this.log.info('connection', 'CREATE_BOT — instantiating mineflayer client');
+    this.timeline.create = Date.now();
+    this.log.info('connection', `CREATE_BOT session=${this.sessionId} ts=${new Date().toISOString()}`);
     try {
       bot = mineflayer.createBot(createOpts as any);
     } catch (err) {
@@ -275,7 +303,8 @@ export class MinecraftBotManager extends EventEmitter {
     this.store.setStartedAt(Date.now());
 
     bot.once('spawn', async () => {
-      this.log.success('connection', 'SPAWN — bot spawned into the world');
+      this.timeline.spawn = Date.now();
+      this.log.success('connection', `SPAWN session=${this.sessionId} (${this.timeline.spawn - this.timeline.create}ms after CREATE_BOT)`);
       this.store.patchConnection({ state: 'SPAWNED', actualUsername: bot.username ?? actualUsername });
       this.store.patchConnection({ serverVersion: bot.version ?? null });
       this.log.success('connection', `Spawned as ${bot.username} on version ${bot.version}`);
@@ -296,11 +325,18 @@ export class MinecraftBotManager extends EventEmitter {
       } catch (err) {
         this.log.debug('connection', `post-spawn nudge failed: ${(err as Error).message}`);
       }
-      // AuthMe-style servers kick unauthenticated players after ~30s.
-      // Log in automatically if a password is configured.
-      this.runInGameAuth(bot, options);
+      // AuthMe state machine: wait for the server's prompt, classify it, then
+      // send exactly ONE appropriate command. Never blind-fire /login on spawn.
+      this.startAuthFlow(bot, options);
       this.emit('snapshot');
     });
+
+    // Raw message preservation (Phase 2): log raw JSON + plain text.
+    const logRawMessage = (label: string, jsonMsg: any, text: string) => {
+      let rawJson = '';
+      try { rawJson = typeof jsonMsg === 'string' ? jsonMsg : JSON.stringify(jsonMsg); } catch { rawJson = String(jsonMsg); }
+      this.log.debug('chat', `RAW_${label} session=${this.sessionId} raw=${rawJson.slice(0, 400)} plain="${text.slice(0, 300)}"`);
+    };
 
     bot.on('move', () => {
       if (!bot.entity) return;
@@ -346,6 +382,7 @@ export class MinecraftBotManager extends EventEmitter {
 
     bot.on('message', (jsonMsg: any, _pos: any) => {
       const text = jsonMsg?.toString ? jsonMsg.toString() : String(jsonMsg);
+      logRawMessage('MESSAGE', jsonMsg, text);
       const sender = jsonMsg?.jsonMsg?.sender ?? 'Server';
       const id = String(Math.random()).slice(2, 10);
       const msg = {
@@ -359,8 +396,19 @@ export class MinecraftBotManager extends EventEmitter {
       };
       this.store.pushChat(msg);
       this.emit('chat', msg);
-      this.handleAuthPrompt(bot, text, options);
+      this.handleChatForAuth(bot, text);
       this.emit('snapshot');
+    });
+
+    bot.on('messagestr', (messageStr: string, _pos: any, jsonMsg: any) => {
+      logRawMessage('MESSAGESTR', jsonMsg, messageStr);
+      this.handleChatForAuth(bot, messageStr);
+    });
+
+    bot.on('systemChat', (jsonMsg: any, _pos: any) => {
+      const text = jsonMsg?.toString ? jsonMsg.toString() : String(jsonMsg);
+      logRawMessage('SYSTEMCHAT', jsonMsg, text);
+      this.handleChatForAuth(bot, text);
     });
 
     bot.on('chat', (username: string, message: string) => {
@@ -375,7 +423,7 @@ export class MinecraftBotManager extends EventEmitter {
       };
       this.store.pushChat(msg);
       this.emit('chat', msg);
-      this.handleAuthPrompt(bot, message, options);
+      this.handleChatForAuth(bot, message);
       this.emit('snapshot');
     });
 
@@ -398,16 +446,16 @@ export class MinecraftBotManager extends EventEmitter {
       const text = extractChatText(reason) || (typeof reason === 'string' ? reason : (reason != null ? String(reason) : 'kicked'));
       let rawJson = '';
       try { rawJson = typeof reason === 'string' ? reason : JSON.stringify(reason); } catch { rawJson = String(reason); }
-      this.log.warn('connection', `KICKED — raw type=${typeof reason} text="${text}" raw=${rawJson.slice(0, 500)}`);
-      this.handleDisconnect('KICKED', text, options);
+      this.log.warn('connection', `KICKED session=${this.sessionId} raw type=${typeof reason} plain="${text}" raw=${rawJson.slice(0, 500)}`);
+      this.handleDisconnect('SERVER_KICK', text, options);
     });
     bot.on('error', (err: Error & { code?: string }) => {
-      this.log.error('connection', `ERROR — ${err.message}${err.code ? ` (code=${err.code})` : ''}`);
-      this.handleDisconnect('LOST_CONNECTION', err.message, options, err.code);
+      this.log.error('connection', `ERROR session=${this.sessionId} message="${err.message}" code=${err.code ?? 'none'}`);
+      this.handleDisconnect('ERROR', err.message, options, err.code);
     });
     bot.on('end', (reason: string) => {
-      this.log.warn('connection', `END — ${reason || 'disconnected (no reason given)'}`);
-      this.handleDisconnect('LOST_CONNECTION', reason || 'disconnected', options);
+      this.log.warn('connection', `END session=${this.sessionId} reason="${reason || 'disconnected (no reason given)'}"`);
+      this.handleDisconnect('REMOTE_CLOSE', reason || 'disconnected', options);
     });
     bot.on('death', () => {
       this.log.warn('player', 'Bot died');
@@ -427,33 +475,46 @@ export class MinecraftBotManager extends EventEmitter {
     // disconnect. Only the FIRST event may drive the lifecycle, otherwise
     // duplicate reconnect timers stack up and the bot join/leave-loops.
     if (this.disconnectHandled) {
-      this.log.info('connection', `Duplicate disconnect event ignored (${kindRaw}: ${rawMessage}) — already handled`);
+      this.log.info('connection', `Duplicate disconnect event ignored session=${this.sessionId} (${kindRaw}: ${rawMessage}) — already handled`);
       return;
     }
     this.disconnectHandled = true;
+    this.timeline.end = Date.now();
+
+    // Phase 10: classify WHO caused the disconnect.
+    const preSpawn = this.timeline.spawn === 0;
+    let disconnectSource = 'REMOTE_CLOSE';
+    if (kindRaw === 'SERVER_KICK') disconnectSource = 'SERVER_KICK';
+    else if (['WAITING_FOR_PROMPT', 'LOGIN_REQUIRED', 'LOGIN_SENT', 'REGISTER_REQUIRED', 'REGISTER_SENT', 'AUTH_TIMEOUT', 'AUTH_FAILED'].includes(this.authState) && !preSpawn) disconnectSource = 'AUTH_PLUGIN';
+    else if (preSpawn && (code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EHOSTUNREACH')) disconnectSource = 'NETWORK';
     const combined = `${kindRaw} ${rawMessage}`;
     const reason = classifyError(combined, code);
-    this.log.warn('connection', `Disconnected: ${reason} (${rawMessage})`);
+    this.log.warn('connection', `Disconnected session=${this.sessionId} source=${disconnectSource} reason=${reason} raw="${rawMessage}" authState=${this.authState}`);
+    if (this.timeline.spawn) {
+      this.log.warn('connection', `TIMELINE session=${this.sessionId} CREATE→SPAWN=${this.timeline.spawn - this.timeline.create}ms SPAWN→END=${this.timeline.end - this.timeline.spawn}ms firstAuthMsg=${this.timeline.firstAuthMsg ? `${this.timeline.firstAuthMsg - this.timeline.spawn}ms after SPAWN` : 'never'} authSent=${this.timeline.authSent ? `${this.timeline.authSent - this.timeline.spawn}ms after SPAWN` : 'never'}`);
+    }
     this.store.patchConnection({
       state: 'ERROR',
-      lastDisconnect: reason,
-      lastDisconnectMessage: rawMessage,
+      lastDisconnect: disconnectSource === 'AUTH_PLUGIN' ? 'AUTH_REQUIRED' : reason,
+      lastDisconnectMessage: `${disconnectSource}: ${rawMessage}`,
       lastDisconnectAt: Date.now(),
     });
     this.emit('snapshot');
-    await this.destroyBot('disconnected');
-    // AuthMe-style kick with no password configured: retrying cannot ever
-    // succeed, so stop the loop and surface an actionable message instead.
-    const looksLikeAuthKick = /not\s+authenticated|not\s+logged\s+in|please\s+(log\s?in|authenticate)|use\s+\/login|authentication\s+timeout|register/i.test(rawMessage);
-    if (looksLikeAuthKick && !options.authPassword) {
-      this.log.error('auth', 'Server kicked the bot for not authenticating (AuthMe-style plugin) and no in-game password is configured. Set "In-game password" in the dashboard or BOT_PASSWORD env, then Connect. Auto-reconnect stopped.');
-      this.store.patchConnection({ state: 'ERROR', lastDisconnect: 'AUTH_REQUIRED' });
+    await this.destroyBot('disconnect cleanup', 'handleDisconnect');
+    // Clear stale player/position/health/inventory/nearby data so the
+    // dashboard shows offline state, not leftovers from the previous session.
+    this.store.resetRuntime();
+    this.emit('snapshot');
+    // Auth failures/timeout are permanent — never loop on them.
+    if (disconnectSource === 'AUTH_PLUGIN' || this.authState === 'AUTH_FAILED' || this.authState === 'AUTH_TIMEOUT') {
+      this.log.error('connection', `AUTH_PLUGIN disconnect session=${this.sessionId} — not auto-reconnecting. Fix the in-game password, then press START BOT.`);
+      this.store.patchConnection({ state: 'ERROR' });
       this.backoff.attempt = 0;
       this.emit('snapshot');
       return;
     }
     if (isPermanent(reason)) {
-      this.log.error('connection', 'Permanent disconnect — not auto-reconnecting. Update settings and click Connect.');
+      this.log.error('connection', `Permanent disconnect session=${this.sessionId} — not auto-reconnecting. Update settings and click Connect.`);
       this.store.patchConnection({ state: 'ERROR' });
       this.backoff.attempt = 0;
       this.emit('snapshot');
@@ -477,58 +538,141 @@ export class MinecraftBotManager extends EventEmitter {
   private lastMoveAt = 0;
   private positionWatchdog: NodeJS.Timeout | null = null;
 
-  /**
-   * Servers protected by AuthMe-style plugins kick players that never run
-   * /login. If the user configured a password, authenticate right after
-   * spawn. Never logs the password itself.
+  /* ------------------------------------------------------------------ */
+  /* AuthMe state machine (the ONLY code path that sends /login //register) */
+  /*
+   * AUTH_UNKNOWN → WAITING_FOR_PROMPT → LOGIN_REQUIRED/REGISTER_REQUIRED
+   *   → LOGIN_SENT/REGISTER_SENT → AUTHENTICATED
+   *   → AUTH_FAILED | AUTH_TIMEOUT | AUTH_MISSING_PASSWORD
    */
-  private runInGameAuth(bot: any, options: ConnectOptions) {
-    const pw = options.authPassword ?? '';
-    if (!pw) {
-      this.log.info('auth', 'No in-game password configured — if the server requires /login, set "In-game password" in Settings');
+  private authState = 'AUTH_UNKNOWN';
+  private authTimer: NodeJS.Timeout | null = null;
+  private lastAuthCommand: string | null = null;
+  private lastAuthCommandAt = 0;
+  private authAttemptCount = 0;
+  private static readonly AUTH_TIMEOUT_MS = 45_000;
+  private static readonly AUTH_COMMAND_COOLDOWN_MS = 6_000;
+  private static readonly MAX_AUTH_ATTEMPTS = 3;
+
+  private resetAuthSession() {
+    this.authState = 'AUTH_UNKNOWN';
+    if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+    this.lastAuthCommand = null;
+    this.lastAuthCommandAt = 0;
+    this.authAttemptCount = 0;
+  }
+
+  /** Called on SPAWN. Waits for the server's AuthMe prompt — never blind-fires. */
+  private startAuthFlow(bot: any, options: ConnectOptions) {
+    this.resetAuthSession();
+    this.authState = 'WAITING_FOR_PROMPT';
+    this.log.info('auth', `AUTH_STATE_CHANGE → WAITING_FOR_PROMPT session=${this.sessionId} (password source: ${options.authPassword ? 'configured' : 'MISSING'})`);
+    if (!options.authPassword) {
+      this.log.warn('auth', `AUTH_MISSING_PASSWORD session=${this.sessionId} — server may kick the bot if it requires AuthMe login. Set the in-game password in the dashboard or BOT_PASSWORD env.`);
       return;
     }
-    const sendLogin = () => {
-      try {
-        bot.chat(`/login ${pw}`);
-        this.log.success('auth', 'Sent in-game /login command');
-      } catch (err) {
-        this.log.warn('auth', `in-game login failed: ${(err as Error).message}`);
+    // Single authentication timeout. Reset/cancelled by AUTHENTICATED or failure.
+    this.authTimer = setTimeout(() => {
+      if (this.authState !== 'AUTHENTICATED' && this.authState !== 'AUTH_FAILED') {
+        this.authState = 'AUTH_TIMEOUT';
+        this.log.error('auth', `AUTH_STATE_CHANGE → AUTH_TIMEOUT session=${this.sessionId} after ${MinecraftBotManager.AUTH_TIMEOUT_MS}ms without authentication success. Stopping (no reconnect).`);
+        this.authTimer = null;
+        this.emit('snapshot');
       }
-    };
-    setTimeout(sendLogin, 1200);
+    }, MinecraftBotManager.AUTH_TIMEOUT_MS);
+    this.authTimer.unref?.();
   }
 
   /**
-   * Detect "not registered" / "not authenticated" prompts in chat and react
-   * with /register or /login using the configured password.
+   * The single controller for AuthMe. Classifies the prompt and sends at most
+   * ONE command per prompt, with cooldown + attempt cap.
    */
-  private handleAuthPrompt(bot: any, text: string, options: ConnectOptions) {
-    const pw = options.authPassword ?? '';
-    if (!pw) return;
+  private handleChatForAuth(bot: any, text: string) {
+    if (this.authState === 'AUTHENTICATED' || this.authState === 'AUTH_FAILED') return;
+    if (!text) return;
     const t = text.toLowerCase();
-    if (/not\s+registered|register.*with|\/register/.test(t) && /register/.test(t)) {
-      this.log.warn('auth', 'Server reports bot is not registered — sending /register');
-      try {
-        bot.chat(`/register ${pw} ${pw}`);
-        this.log.success('auth', 'Sent in-game /register command');
-        setTimeout(() => {
-          try {
-            bot.chat(`/login ${pw}`);
-            this.log.success('auth', 'Sent in-game /login command after register');
-          } catch {}
-        }, 1500);
-      } catch (err) {
-        this.log.warn('auth', `in-game register failed: ${(err as Error).message}`);
+    if (this.timeline.firstAuthMsg === 0 && /(login|register|authenticat)/.test(t)) {
+      this.timeline.firstAuthMsg = Date.now();
+      this.log.info('auth', `AUTH_MESSAGE_RECEIVED session=${this.sessionId} (${this.timeline.spawn ? `${this.timeline.firstAuthMsg - this.timeline.spawn}ms after SPAWN` : 'pre-spawn'}) raw="${text.slice(0, 200)}"`);
+    }
+
+    // Success (Phase 7)
+    if (/you are now authenticated|successfully logged in|login successful|logged in successfully|you are now logged in/.test(t)) {
+      if (this.authState !== 'AUTHENTICATED') {
+        this.authState = 'AUTHENTICATED';
+        if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+        this.log.success('auth', `AUTHENTICATED_CONFIRMED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
+        this.emit('snapshot');
       }
-    } else if (/not\s+authenticated|not\s+logged\s+in|please (log ?in|authenticate)|use \/login|authentication\s+timeout/.test(t)) {
-      this.log.warn('auth', 'Server reports bot is not authenticated — re-sending /login');
-      try {
-        bot.chat(`/login ${pw}`);
-        this.log.success('auth', 'Sent in-game /login command (retry)');
-      } catch {}
+      return;
+    }
+
+    // Incorrect password (Phase 6) — critical, hard stop.
+    if (/incorrect password|wrong password/.test(t)) {
+      this.authState = 'AUTH_FAILED';
+      if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+      this.backoff.stopped = true; // never retry the same wrong password
+      this.log.error('auth', `AUTH_STATE_CHANGE → AUTH_FAILED session=${this.sessionId} server said: "${text.slice(0, 200)}". AuthMe rejected the configured password. Auto-reconnect STOPPED — update the password and press START BOT.`);
+      this.store.patchConnection({ state: 'ERROR', lastDisconnect: 'AUTH_REQUIRED', lastDisconnectMessage: `AuthMe rejected the password: ${text.slice(0, 200)}` });
+      this.emit('snapshot');
+      return;
+    }
+
+    // Registration explicitly requested (Phase 4)
+    if (/not registered|register (with|using)|use \/register/.test(t) && /register/.test(t)) {
+      this.authState = 'REGISTER_REQUIRED';
+      this.log.info('auth', `AUTH_STATE_CHANGE → REGISTER_REQUIRED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
+      this.sendAuthCommand(bot, 'register');
+      return;
+    }
+
+    // Login requested (Phase 4)
+    if (/not authenticated|not logged in|please (log ?in|authenticate)|use \/login|use \/l\b|log ?in to authenticate|authentication timeout/.test(t)) {
+      this.authState = 'LOGIN_REQUIRED';
+      this.log.info('auth', `AUTH_STATE_CHANGE → LOGIN_REQUIRED session=${this.sessionId} raw="${text.slice(0, 200)}"`);
+      this.sendAuthCommand(bot, 'login', undefined as any);
+      return;
     }
   }
+
+  /** Cooldown + attempt-capped single-command sender. */
+  private sendAuthCommand(bot: any, type: 'login' | 'register', _unused?: any) {
+    const pw = this.currentAuthPassword;
+    if (!pw) { this.log.warn('auth', `AUTH_COMMAND_SKIPPED type=${type} session=${this.sessionId} — no password configured`); return; }
+    if (this.authAttemptCount >= MinecraftBotManager.MAX_AUTH_ATTEMPTS) {
+      this.log.error('auth', `AUTH_COMMAND_SKIPPED type=${type} session=${this.sessionId} — attempt cap (${MinecraftBotManager.MAX_AUTH_ATTEMPTS}) reached`);
+      return;
+    }
+    const since = Date.now() - this.lastAuthCommandAt;
+    if (this.lastAuthCommand && since < MinecraftBotManager.AUTH_COMMAND_COOLDOWN_MS) {
+      this.log.info('auth', `AUTH_COMMAND_SUPPRESSED type=${type} session=${this.sessionId} — last command ${this.lastAuthCommand} sent ${since}ms ago, waiting for result`);
+      return;
+    }
+    const cmd = type === 'login' ? `/login ${pw}` : `/register ${pw} ${pw}`;
+    this.authAttemptCount++;
+    this.lastAuthCommand = type;
+    this.lastAuthCommandAt = Date.now();
+    this.timeline.authSent = Date.now();
+    this.authState = type === 'login' ? 'LOGIN_SENT' : 'REGISTER_SENT';
+    this.log.info('auth', `AUTH_COMMAND_SENT session=${this.sessionId} type=${type} attempt=${this.authAttemptCount} ts=${new Date().toISOString()} (contents redacted)`);
+    try {
+      bot.chat(cmd);
+    } catch (err) {
+      this.log.warn('auth', `AUTH_COMMAND_FAILED type=${type} session=${this.sessionId} error=${(err as Error).message}`);
+    }
+    // After a successful registration, log in once.
+    if (type === 'register') {
+      setTimeout(() => {
+        if (this.authState === 'REGISTER_SENT' || this.authState === 'REGISTER_REQUIRED') {
+          this.authState = 'LOGIN_REQUIRED';
+          this.sendAuthCommand(bot, 'login');
+        }
+      }, 2000);
+    }
+  }
+
+  /** The one resolved password for the CURRENT connection (set in connect()). */
+  private currentAuthPassword = '';
 
   /**
    * mc.238458.xyz is a proxy that aggressively times out clients that look
@@ -614,8 +758,8 @@ export class MinecraftBotManager extends EventEmitter {
     }
   }
 
-  async destroyBot(reason: string): Promise<void> {
-    this.log.info('connection', `DESTROY_BOT — tearing down bot (${reason})`);
+  async destroyBot(reason: string, caller = 'unknown'): Promise<void> {
+    this.log.info('connection', `DESTROY_BOT session=${this.sessionId} reason=${reason} caller=${caller}`);
     this.stopKeepAliveLoop();
     if (this.viewCleanup) {
       try {

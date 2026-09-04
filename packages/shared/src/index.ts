@@ -69,6 +69,8 @@ export interface ConnectionInfo {
   autoReconnect: boolean;
   startedAt: number | null;
   uptimeMs: number;
+  /** True when an AuthMe password is configured (value never exposed). */
+  authPasswordSet?: boolean;
 }
 
 export interface Vec3 {

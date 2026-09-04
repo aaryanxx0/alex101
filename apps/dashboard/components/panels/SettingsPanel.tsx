@@ -51,14 +51,27 @@ export function SettingsPanel({ snapshot, onConnect, onDisconnect, onUpdateSetti
             <input type="number" min={1} max={32} value={viewDistance} onChange={(e) => setViewDistance(Math.max(1, Math.min(32, Number(e.target.value))))} />
           </div>
           <div>
-            <label>In-game password (AuthMe /login) — optional</label>
+            <label>Minecraft server / AuthMe password</label>
             <input
               type="password"
               value={authPassword}
               onChange={(e) => setAuthPassword(e.target.value)}
-              placeholder="Only if the server asks Alex101 to /login"
-              autoComplete="off"
+              placeholder={snapshot?.connection.authPasswordSet ? 'Password is saved on the worker — type only to change it' : 'Sent as /login after spawn (server-dependent)'}
+              autoComplete="new-password"
             />
+            <div className="row" style={{ gap: 8, marginTop: 6, alignItems: 'center' }}>
+              <span className="tiny muted">
+                Status: <strong style={{ color: snapshot?.connection.authPasswordSet ? 'var(--good)' : 'var(--warn)' }}>
+                  {snapshot?.connection.authPasswordSet ? 'Configured' : 'Not configured'}
+                </strong>
+                {' — '}
+                <span style={{ color: 'var(--fg-2)' }}>the saved value never leaves the worker.</span>
+              </span>
+            </div>
+            <div className="row" style={{ gap: 8, marginTop: 6 }}>
+              <button onClick={() => onUpdateSettings({ authPassword })} disabled={!authPassword}>Save securely</button>
+              {authPassword && <button onClick={() => { setAuthPassword(''); onUpdateSettings({ authPassword: '' }); }}>Clear saved password</button>}
+            </div>
           </div>
         </div>
         <div className="row" style={{ gap: 16, marginTop: 12 }}>

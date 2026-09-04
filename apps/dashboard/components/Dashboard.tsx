@@ -85,6 +85,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
     return new URLSearchParams(window.location.search).get('debug') === '1'
       || window.localStorage.getItem('alex101_debug') === '1';
   });
+  const [isTouchDevice] = useState(() => typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches);
   const [diagToken, setDiagToken] = useState<'OK' | 'FAIL' | 'WAITING'>('WAITING');
   const [diagWs, setDiagWs] = useState<'CONNECTING' | 'CONNECTED' | 'AUTHENTICATED' | 'CLOSED' | 'ERROR'>('CONNECTING');
   const [diagSnapshot, setDiagSnapshot] = useState<'WAITING' | 'RECEIVED'>('WAITING');
@@ -177,6 +178,8 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       ws.onclose = (ev) => {
         setConnected(false);
         setDiagWs('CLOSED');
+        // Stuck-key protection: dropping the WS must release all held keys.
+        movementKeysRef.current.clear();
         console.warn(`[alex101] WS closed code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
         wsRef.current = null;
         // Reconnect with backoff
@@ -251,8 +254,12 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       KeyD: 'right', ArrowRight: 'right',
       Space: 'jump',
       ShiftLeft: 'sneak', ShiftRight: 'sneak',
-      ControlLeft: 'sprint', ControlRight: 'sprint',
+      AltLeft: 'sprint', AltRight: 'sprint',
     };
+    function clearAllMovement() {
+      movementKeysRef.current.clear();
+      sendCommand({ type: 'clear-movement' });
+    }
     function onKeyDown(e: KeyboardEvent) {
       if (e.repeat) return;
       if (!isController) return;
@@ -261,19 +268,18 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       const k = map[e.code];
       if (k) {
         e.preventDefault();
+        if (k === 'sprint') e.preventDefault(); // prevent browser menu on Alt
         if (!movementKeysRef.current.has(e.code)) {
           movementKeysRef.current.add(e.code);
           applyMovement({ [k]: true } as any);
         }
-      } else if (e.code === 'KeyT' || (e.code === 'Enter' && !snapshot?.control?.controllerId)) {
-        // T to focus chat input handled separately
       } else if (/Digit[1-9]/.test(e.code)) {
         const slot = Number(e.code.replace('Digit', '')) - 1;
         sendCommand({ type: 'select-hotbar', slot });
       } else if (e.code === 'Escape') {
-        if (document.pointerLockElement) {
-          document.exitPointerLock();
-        }
+        // ESC releases pointer lock and clears all held controls (stuck-key protection)
+        if (document.pointerLockElement) document.exitPointerLock();
+        clearAllMovement();
       }
     }
     function onKeyUp(e: KeyboardEvent) {
@@ -283,11 +289,22 @@ export function Dashboard({ workerUrl }: DashboardProps) {
         applyMovement({ [k]: false } as any);
       }
     }
+    function onBlurProtection() {
+      if (movementKeysRef.current.size > 0) clearAllMovement();
+    }
+    function onPointerLockLoss() {
+      setPointerLock(!!document.pointerLockElement);
+      if (!document.pointerLockElement && movementKeysRef.current.size > 0) clearAllMovement();
+    }
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlurProtection);
+    document.addEventListener('pointerlockchange', onPointerLockLoss);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlurProtection);
+      document.removeEventListener('pointerlockchange', onPointerLockLoss);
     };
   }, [isController, snapshot?.control?.controllerId]);
 
@@ -324,6 +341,27 @@ export function Dashboard({ workerUrl }: DashboardProps) {
   const onDisconnect = useCallback(() => sendCommand({ type: 'disconnect' }), []);
   const onRespawn = useCallback(() => sendCommand({ type: 'respawn' }), []);
   const onEmergencyStop = useCallback(() => sendCommand({ type: 'emergency-stop' }), []);
+
+  // ---- Lifecycle toolbar (START/STOP BOT) ----
+  const connState = snapshot?.connection.state ?? 'OFFLINE';
+  const canStart = connState === 'OFFLINE' || connState === 'ERROR';
+  const canStop = !canStart && connState !== 'DISCONNECTING';
+  const startBot = useCallback(() => {
+    const c = snapshot?.connection;
+    if (!c) return;
+    // authPassword intentionally omitted: the worker resolves the saved
+    // protected setting / BOT_PASSWORD env (password never round-trips here).
+    onConnect({
+      host: c.host,
+      port: c.port,
+      username: c.configuredUsername,
+      version: c.minecraftVersion,
+      authMode: c.authMode,
+      autoReconnect: true,
+      reconnectDelayMs: 5000,
+      viewDistance: snapshot?.viewer.renderDistance ?? 6,
+    });
+  }, [snapshot?.connection, snapshot?.viewer.renderDistance, onConnect]);
   const onChatSend = useCallback((msg: string) => sendCommand({ type: 'chat', message: msg }), []);
   useEffect(() => {
     (window as any).__alex101_send_chat = onChatSend;
@@ -399,11 +437,10 @@ export function Dashboard({ workerUrl }: DashboardProps) {
           </span>
         </div>
         <div className="row">
-          {snapshot?.viewer?.viewerBaseUrl && (
-            <a href={snapshot.viewer.viewerBaseUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', fontSize: 12 }}>
-              Open viewer in new tab
-            </a>
-          )}
+          {canStart && <button className="primary" onClick={startBot}>START BOT</button>}
+          {canStop && <button className="danger" onClick={onDisconnect}>STOP BOT</button>}
+          {connState === 'SPAWNED' && <button onClick={onRespawn}>Respawn</button>}
+          {connState === 'SPAWNED' && <button className="danger" onClick={onEmergencyStop}>EMERGENCY STOP</button>}
           {!isController && otherController && (
             <button onClick={onRequestControl}>Take control</button>
           )}
@@ -455,7 +492,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
                 <div className="fullscreen-prompt">Click to enable pointer lock — WASD/mouse to control</div>
               )}
               <HudOverlay snapshot={snapshot} isController={isController} />
-              {isController && (
+              {isController && isTouchDevice && (
                 <MobileOverlay
                   onMove={(k, v) => applyMovement({ [k]: v } as any)}
                   onJump={() => applyMovement({ jump: true })}
@@ -471,16 +508,18 @@ export function Dashboard({ workerUrl }: DashboardProps) {
               />
             </div>
             <div className="row" style={{ marginTop: 8, flexWrap: 'wrap' }}>
-              <ControlPad onPress={(key, value) => {
-                if (key === 'jump') {
-                  if (value) applyMovement({ jump: true });
-                  else applyMovement({ jump: false });
-                } else {
-                  applyMovement({ [key]: value } as any);
-                }
-              }} />
-              <button className="danger" onClick={onEmergencyStop}>EMERGENCY STOP</button>
-              <button onClick={onRespawn}>Respawn</button>
+              {isTouchDevice && (
+                <ControlPad onPress={(key, value) => {
+                  if (key === 'jump') {
+                    if (value) applyMovement({ jump: true });
+                    else applyMovement({ jump: false });
+                  } else {
+                    applyMovement({ [key]: value } as any);
+                  }
+                }} />
+              )}
+              {connState === 'SPAWNED' && <button className="danger" onClick={onEmergencyStop}>EMERGENCY STOP</button>}
+              {connState === 'SPAWNED' && <button onClick={onRespawn}>Respawn</button>}
             </div>
           </div>
           <div className="sidebar">

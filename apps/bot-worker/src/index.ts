@@ -14,6 +14,7 @@ import { ControlSessionManager } from './ControlSessionManager.js';
 import { RealtimeGateway, createTokenIssuer } from './RealtimeGateway.js';
 import { refreshInventory } from './InventoryManager.js';
 import { classifyError } from './errorClassifier.js';
+import dns from 'node:dns';
 import { DEFAULT_SETTINGS, makeId } from '@alex101/shared';
 
 const HOST = process.env.BOT_WORKER_HOST || '0.0.0.0';
@@ -110,6 +111,45 @@ app.get('/health', (_req: Request, res: Response) => {
     });
   });
 
+  /**
+   * Network diagnostic (Phase 13): DNS A/AAAA/SRV + raw TCP reachability from
+   * the worker's own environment. Controlled — performs one TCP test per call.
+   */
+  app.get('/debug/network', async (req: Request, res: Response) => {
+    const provided = req.headers['x-bot-worker-secret'];
+    if (typeof provided !== 'string' || provided !== SECRET) {
+      res.status(401).json({ error: 'invalid shared secret' });
+      return;
+    }
+    const host = String(req.query.host || config.get().host || 'mc.238458.xyz');
+    const port = Number(req.query.port || config.get().port || 25565);
+    const tcpTest = (targetHost: string, targetPort: number, timeoutMs = 12_000) => new Promise<{ result: string; elapsedMs: number; ip?: string }>((resolve) => {
+      const started = Date.now();
+      const socket = new net.Socket();
+      const done = (result: string, ip?: string) => {
+        socket.destroy();
+        resolve({ result, elapsedMs: Date.now() - started, ip });
+      };
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => done('TCP_CONNECTED'));
+      socket.once('timeout', () => done('TCP_TIMEOUT'));
+      socket.once('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'ECONNREFUSED') done('TCP_REFUSED', undefined);
+        else if (err.code === 'ETIMEDOUT') done('TCP_TIMEOUT');
+        else done(`TCP_ERROR:${err.code ?? err.message}`);
+      });
+      socket.connect(targetPort, targetHost);
+    });
+    const r4 = dns.promises.resolve4(host).catch((e) => [`DNS_ERROR:${e.code ?? e.message}`]);
+    const r6 = dns.promises.resolve6(host).catch((e) => [`DNS_ERROR:${e.code ?? e.message}`]);
+    const srv = dns.promises.resolveSrv(`_minecraft._tcp.${host}`).catch((e) => [{ error: `DNS_ERROR:${e.code ?? e.message}` }]);
+    const [a, aaaa, srvRecords] = await Promise.all([r4, r6, srv]);
+    const tcpHostname = await tcpTest(host, port);
+    const firstA = Array.isArray(a) && a.length > 0 && !String(a[0]).startsWith('DNS_ERROR') ? (a[0] as string) : null;
+    const tcpIpv4 = firstA ? await tcpTest(firstA, port) : null;
+    res.json({ host, port, dnsA: a, dnsAAAA: aaaa, dnsSrv: srvRecords, tcpHostname, tcpIpv4, testedAt: new Date().toISOString() });
+  });
+
   // Catch-all error handler
   app.use((err: Error, _req: Request, res: Response, _next: any) => {
     log.error('http', err.message);
@@ -186,6 +226,12 @@ app.get('/health', (_req: Request, res: Response) => {
   bot.on('viewer', (state: any) => {
     gateway.pushViewerState(state);
   });
+
+  // Expose whether an AuthMe password is configured (value never leaves worker).
+  {
+    const settings = config.get();
+    store.patchConnection({ authPasswordSet: !!settings.authPassword || !!process.env.BOT_PASSWORD });
+  }
 
   // Patch bot to refresh inventory & nearby on relevant events
   bot.on('snapshot', () => {
