@@ -537,7 +537,11 @@ export class MinecraftBotManager extends EventEmitter {
     this.store.patchConnection({
       state: 'ERROR',
       lastDisconnect: disconnectSource === 'AUTH_PLUGIN' ? 'AUTH_REQUIRED' : reason,
-      lastDisconnectMessage: `${disconnectSource}: ${rawMessage}`,
+      // Keep the friendly message set by the auth machine (e.g. missing
+      // password guidance) instead of the raw quit reason.
+      lastDisconnectMessage: this.authState === 'AUTH_PASSWORD_REQUIRED'
+        ? 'Alex101 requires an in-game server password. Open Settings → Minecraft server / AuthMe password, save it, then press START BOT.'
+        : `${disconnectSource}: ${rawMessage}`,
       lastDisconnectAt: Date.now(),
     });
     this.emit('snapshot');
