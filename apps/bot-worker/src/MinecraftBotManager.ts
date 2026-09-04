@@ -96,6 +96,9 @@ export class MinecraftBotManager extends EventEmitter {
   private timeline: { create: number; spawn: number; firstAuthMsg: number; authSent: number; end: number } = { create: 0, spawn: 0, firstAuthMsg: 0, authSent: 0, end: 0 };
   /** Ring of recent packet names/states for disconnect diagnosis. */
   private packetRing: string[] = [];
+  /** Keep-alive counters for the current session (inbound = server-sent). */
+  private keepAliveIn = 0;
+  private keepAliveOut = 0;
 
   constructor(
     private readonly log: LogManager,
@@ -285,13 +288,15 @@ export class MinecraftBotManager extends EventEmitter {
       hideErrors: false,
       connectTimeout: 60_000,
       // Render's free tier drops idle TCP sessions after ~30s. Keep the socket
-      // busy with very frequent keep-alives and force Minecraft's keep-alive
-      // timeout to be much higher than the network's.
+      // busy with very frequent keep-alives.
       keepAliveInterval: 2000,
       closeTimeout: 5_000,
       respawn: true,
-      // Force our packet queue to be aggressive
-      checkTimeoutInterval: 30_000,
+      // Vanilla clients never self-terminate on keep-alive silence — the
+      // server is the authority. A 30s self-kill here murdered healthy
+      // sessions ("client timed out after 30000 milliseconds"). Use a long,
+      // bounded tolerance instead.
+      checkTimeoutInterval: 180_000,
       // mc.238458.xyz is a proxy — make the bot handle the "already
       // connected" backoff gracefully.
       kickTimeout: 60_000,
@@ -320,11 +325,17 @@ export class MinecraftBotManager extends EventEmitter {
 
     // ---- Packet tracing (name + state only; payload for interesting packets) ----
     this.packetRing = [];
+    this.keepAliveIn = 0;
+    this.keepAliveOut = 0;
     const INTEREST = /^(open_sign_editor|open_window|open_screen|open_horse_window|block_entity_data|block_update|block_action|update_sign|sign_update|open_book|close_window|close_container|custom_payload|client_command|disconnect|kick_disconnect|chat_command|chat_message|server_links|cookie_request|store_cookie|select_known_packs|feature_flags|registry_data|keep_alive|position|teleport|login|success|set_compression)$/i;
     const trace = (dir: 'IN' | 'OUT', name: string, state: string, data?: any) => {
       const entry = `${new Date().toISOString()} ${dir} ${state}/${name}`;
       this.packetRing.push(entry);
-      if (this.packetRing.length > 40) this.packetRing.shift();
+      if (this.packetRing.length > 200) this.packetRing.shift();
+      if (/keep_alive/i.test(name)) {
+        if (dir === 'IN') this.keepAliveIn++; else this.keepAliveOut++;
+        this.log.info('packet', `KEEPALIVE_${dir} session=${this.sessionId} (in=${this.keepAliveIn} out=${this.keepAliveOut})`);
+      }
       if (INTEREST.test(name)) {
         let detail = '';
         if (data) { try { detail = JSON.stringify(data); } catch { detail = '(unserializable)'; } }
@@ -533,6 +544,7 @@ export class MinecraftBotManager extends EventEmitter {
     const reason = classifyError(combined, code);
     this.log.warn('connection', `Disconnected session=${this.sessionId} source=${disconnectSource} reason=${reason} raw="${rawMessage}" authState=${this.authState}`);
     this.log.warn('connection', `LAST_20_PACKETS session=${this.sessionId} [${this.packetRing.slice(-20).join(' | ')}]`);
+    this.log.warn('connection', `KEEPALIVE_STATS session=${this.sessionId} serverSent(keepAliveIn)=${this.keepAliveIn} clientSent(keepAliveOut)=${this.keepAliveOut}`);
     if (this.timeline.spawn) {
       this.log.warn('connection', `TIMELINE session=${this.sessionId} CREATE→SPAWN=${this.timeline.spawn - this.timeline.create}ms SPAWN→END=${this.timeline.end - this.timeline.spawn}ms firstAuthMsg=${this.timeline.firstAuthMsg ? `${this.timeline.firstAuthMsg - this.timeline.spawn}ms after SPAWN` : 'never'} authSent=${this.timeline.authSent ? `${this.timeline.authSent - this.timeline.spawn}ms after SPAWN` : 'never'}`);
     }
