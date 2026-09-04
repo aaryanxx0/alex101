@@ -255,7 +255,7 @@ export type ClientCommand =
   | { type: 'hello'; token: string; controllerId: string; controllerName: string }
   | { type: 'heartbeat'; controllerId: string; ts: number }
   | { type: 'request-snapshot' }
-  | { type: 'connect'; options: ConnectOptions }
+  | { type: 'connect'; options: ConnectOptions; requestId?: string }
   | { type: 'disconnect' }
   | { type: 'reconnect' }
   | { type: 'respawn' }

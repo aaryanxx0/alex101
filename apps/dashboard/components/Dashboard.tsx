@@ -260,7 +260,7 @@ export function Dashboard({ workerUrl }: DashboardProps) {
   const settings = snapshot?.connection;
 
   const onConnect = useCallback((opts: ConnectOptions) => {
-    sendCommand({ type: 'connect', options: opts });
+    sendCommand({ type: 'connect', options: opts, requestId: makeId('req') });
   }, []);
   const onDisconnect = useCallback(() => sendCommand({ type: 'disconnect' }), []);
   const onRespawn = useCallback(() => sendCommand({ type: 'respawn' }), []);

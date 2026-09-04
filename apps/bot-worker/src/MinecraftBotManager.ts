@@ -11,7 +11,7 @@ import type { PathfinderController } from './PathfinderController.js';
 import type { ControlSessionManager } from './ControlSessionManager.js';
 import { EventEmitter } from 'node:events';
 
-const BACKOFF_BASE_MS = 1500;
+const BACKOFF_BASE_MS = 5000;
 const BACKOFF_MAX_MS = 60_000;
 
 interface BackoffState {
@@ -84,6 +84,10 @@ export class MinecraftBotManager extends EventEmitter {
   private view: any = null;
   private viewCleanup: (() => Promise<void>) | null = null;
   private readonly backoff: BackoffState = { attempt: 0, timer: null, stopped: false };
+  /** Guards against kicked+end both invoking handleDisconnect for one disconnect. */
+  private disconnectHandled = false;
+  /** Guards concurrent connect() calls while a connection attempt is in flight. */
+  private connecting = false;
 
   constructor(
     private readonly log: LogManager,
@@ -110,33 +114,53 @@ export class MinecraftBotManager extends EventEmitter {
     return this.store.snapshot();
   }
 
-  async connect(options: ConnectOptions): Promise<void> {
-    if (this.bot) {
-      this.log.warn('connection', 'Connect requested while already connected — ignoring');
+  async connect(options: ConnectOptions, requestId?: string): Promise<void> {
+    this.log.info('connection', `CONNECT_REQUEST received (requestId=${requestId ?? 'n/a'}, host=${options.host}:${options.port}, user=${options.username}, autoReconnect=${options.autoReconnect}, password=${options.authPassword ? 'set' : 'NOT SET'})`);
+    if (this.connecting) {
+      this.log.warn('connection', 'Connect requested while a connection attempt is already in flight — ignoring (idempotent)');
       return;
     }
+    if (this.bot) {
+      this.log.warn('connection', 'Connect requested while already connected — ignoring (idempotent)');
+      return;
+    }
+    this.connecting = true;
+    this.disconnectHandled = false;
     this.backoff.stopped = false;
+    // Fall back to the protected BOT_PASSWORD env var when no dashboard
+    // password is configured. Never logged.
+    const effectiveOptions: ConnectOptions = {
+      ...options,
+      authPassword: options.authPassword || process.env.BOT_PASSWORD || '',
+    };
+    if (!effectiveOptions.authPassword) {
+      this.log.warn('auth', 'No in-game password available (neither dashboard setting nor BOT_PASSWORD env) — AuthMe-protected servers will kick the bot');
+    }
     this.store.patchConnection({
-      host: options.host,
-      port: options.port,
-      configuredUsername: options.username,
-      minecraftVersion: options.version,
-      authMode: options.authMode,
-      autoReconnect: options.autoReconnect,
+      host: effectiveOptions.host,
+      port: effectiveOptions.port,
+      configuredUsername: effectiveOptions.username,
+      minecraftVersion: effectiveOptions.version,
+      authMode: effectiveOptions.authMode,
+      autoReconnect: effectiveOptions.autoReconnect,
     });
-    this.store.patchViewer({ renderDistance: options.viewDistance, ready: false });
+    this.store.patchViewer({ renderDistance: effectiveOptions.viewDistance, ready: false });
     this.config.update({
-      host: options.host,
-      port: options.port,
-      username: options.username,
-      version: options.version,
-      authMode: options.authMode,
-      autoReconnect: options.autoReconnect,
-      reconnectDelayMs: options.reconnectDelayMs,
-      viewDistance: options.viewDistance,
-      authPassword: options.authPassword ?? '',
+      host: effectiveOptions.host,
+      port: effectiveOptions.port,
+      username: effectiveOptions.username,
+      version: effectiveOptions.version,
+      authMode: effectiveOptions.authMode,
+      autoReconnect: effectiveOptions.autoReconnect,
+      reconnectDelayMs: effectiveOptions.reconnectDelayMs,
+      viewDistance: effectiveOptions.viewDistance,
+      authPassword: effectiveOptions.authPassword,
     });
-    await this.attempt(options, /* manual */ false);
+    try {
+      await this.attempt(effectiveOptions, /* manual */ false);
+    } finally {
+      this.connecting = false;
+    }
   }
 
   async disconnect(reason = 'manual'): Promise<void> {
@@ -156,6 +180,12 @@ export class MinecraftBotManager extends EventEmitter {
   private scheduleReconnect(options: ConnectOptions, reason: string = 'unknown') {
     if (!options.autoReconnect) return;
     if (this.backoff.stopped) return;
+    // Exactly ONE reconnect timer may exist at any time.
+    if (this.backoff.timer) {
+      clearTimeout(this.backoff.timer);
+      this.backoff.timer = null;
+      this.log.warn('connection', 'RECONNECT_SCHEDULED — cleared a pre-existing reconnect timer first');
+    }
     this.backoff.attempt++;
     const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (this.backoff.attempt - 1));
     const jitter = Math.random() * 500;
@@ -168,11 +198,12 @@ export class MinecraftBotManager extends EventEmitter {
         : 0;
     const delay = Math.max(options.reconnectDelayMs ?? 5000, base + jitter) + extraDelay;
     this.store.patchConnection({ reconnectAttempts: this.backoff.attempt });
-    this.log.warn('connection', `Scheduling reconnect attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s${proxyAlreadyConnected ? ' (proxy already connected, waiting longer)' : keepAliveFailure ? ' (keepalive timeout, waiting longer)' : ''}`);
+    this.log.warn('connection', `RECONNECT_SCHEDULED attempt #${this.backoff.attempt} in ${(delay / 1000).toFixed(1)}s (reason: ${reason})${proxyAlreadyConnected ? ' [proxy already connected]' : keepAliveFailure ? ' [keepalive timeout]' : ''}`);
     this.store.patchConnection({ state: 'RECONNECTING' });
     this.emit('snapshot');
     this.backoff.timer = setTimeout(() => {
       this.backoff.timer = null;
+      this.log.info('connection', `RECONNECT_ATTEMPT #${this.backoff.attempt} starting now`);
       this.attempt(options, false).catch((err) => {
         this.log.error('connection', `Reconnect attempt failed: ${(err as Error).message}`);
       });
@@ -181,6 +212,7 @@ export class MinecraftBotManager extends EventEmitter {
 
   private async attempt(options: ConnectOptions, manual: boolean): Promise<void> {
     if (this.bot) return;
+    this.disconnectHandled = false; // fresh lifecycle for this connection
     this.store.patchConnection({ state: 'CONNECTING' });
     this.emit('snapshot');
 
@@ -228,6 +260,7 @@ export class MinecraftBotManager extends EventEmitter {
 
     const mineflayer = await import('mineflayer');
     let bot: any;
+    this.log.info('connection', 'CREATE_BOT — instantiating mineflayer client');
     try {
       bot = mineflayer.createBot(createOpts as any);
     } catch (err) {
@@ -242,6 +275,7 @@ export class MinecraftBotManager extends EventEmitter {
     this.store.setStartedAt(Date.now());
 
     bot.once('spawn', async () => {
+      this.log.success('connection', 'SPAWN — bot spawned into the world');
       this.store.patchConnection({ state: 'SPAWNED', actualUsername: bot.username ?? actualUsername });
       this.store.patchConnection({ serverVersion: bot.version ?? null });
       this.log.success('connection', `Spawned as ${bot.username} on version ${bot.version}`);
@@ -362,11 +396,19 @@ export class MinecraftBotManager extends EventEmitter {
 
     bot.on('kicked', (reason: any) => {
       const text = extractChatText(reason) || (typeof reason === 'string' ? reason : (reason != null ? String(reason) : 'kicked'));
-      this.log.warn('connection', `Kicked raw type=${typeof reason} text=${text}`);
+      let rawJson = '';
+      try { rawJson = typeof reason === 'string' ? reason : JSON.stringify(reason); } catch { rawJson = String(reason); }
+      this.log.warn('connection', `KICKED — raw type=${typeof reason} text="${text}" raw=${rawJson.slice(0, 500)}`);
       this.handleDisconnect('KICKED', text, options);
     });
-    bot.on('error', (err: Error & { code?: string }) => this.handleDisconnect('LOST_CONNECTION', err.message, options, err.code));
-    bot.on('end', (reason: string) => this.handleDisconnect('LOST_CONNECTION', reason || 'disconnected', options));
+    bot.on('error', (err: Error & { code?: string }) => {
+      this.log.error('connection', `ERROR — ${err.message}${err.code ? ` (code=${err.code})` : ''}`);
+      this.handleDisconnect('LOST_CONNECTION', err.message, options, err.code);
+    });
+    bot.on('end', (reason: string) => {
+      this.log.warn('connection', `END — ${reason || 'disconnected (no reason given)'}`);
+      this.handleDisconnect('LOST_CONNECTION', reason || 'disconnected', options);
+    });
     bot.on('death', () => {
       this.log.warn('player', 'Bot died');
       this.store.patchPlayer({ health: 0 });
@@ -381,6 +423,14 @@ export class MinecraftBotManager extends EventEmitter {
   }
 
   private async handleDisconnect(kindRaw: string, rawMessage: string, options: ConnectOptions, code?: string) {
+    // Mineflayer emits kicked → end (and sometimes error) for a single
+    // disconnect. Only the FIRST event may drive the lifecycle, otherwise
+    // duplicate reconnect timers stack up and the bot join/leave-loops.
+    if (this.disconnectHandled) {
+      this.log.info('connection', `Duplicate disconnect event ignored (${kindRaw}: ${rawMessage}) — already handled`);
+      return;
+    }
+    this.disconnectHandled = true;
     const combined = `${kindRaw} ${rawMessage}`;
     const reason = classifyError(combined, code);
     this.log.warn('connection', `Disconnected: ${reason} (${rawMessage})`);
@@ -392,6 +442,16 @@ export class MinecraftBotManager extends EventEmitter {
     });
     this.emit('snapshot');
     await this.destroyBot('disconnected');
+    // AuthMe-style kick with no password configured: retrying cannot ever
+    // succeed, so stop the loop and surface an actionable message instead.
+    const looksLikeAuthKick = /not\s+authenticated|not\s+logged\s+in|please\s+(log\s?in|authenticate)|use\s+\/login|authentication\s+timeout|register/i.test(rawMessage);
+    if (looksLikeAuthKick && !options.authPassword) {
+      this.log.error('auth', 'Server kicked the bot for not authenticating (AuthMe-style plugin) and no in-game password is configured. Set "In-game password" in the dashboard or BOT_PASSWORD env, then Connect. Auto-reconnect stopped.');
+      this.store.patchConnection({ state: 'ERROR', lastDisconnect: 'AUTH_REQUIRED' });
+      this.backoff.attempt = 0;
+      this.emit('snapshot');
+      return;
+    }
     if (isPermanent(reason)) {
       this.log.error('connection', 'Permanent disconnect — not auto-reconnecting. Update settings and click Connect.');
       this.store.patchConnection({ state: 'ERROR' });
@@ -461,7 +521,7 @@ export class MinecraftBotManager extends EventEmitter {
       } catch (err) {
         this.log.warn('auth', `in-game register failed: ${(err as Error).message}`);
       }
-    } else if (/not\s+authenticated|please (log ?in|authenticate)|use \/login/.test(t)) {
+    } else if (/not\s+authenticated|not\s+logged\s+in|please (log ?in|authenticate)|use \/login|authentication\s+timeout/.test(t)) {
       this.log.warn('auth', 'Server reports bot is not authenticated — re-sending /login');
       try {
         bot.chat(`/login ${pw}`);
@@ -555,6 +615,7 @@ export class MinecraftBotManager extends EventEmitter {
   }
 
   async destroyBot(reason: string): Promise<void> {
+    this.log.info('connection', `DESTROY_BOT — tearing down bot (${reason})`);
     this.stopKeepAliveLoop();
     if (this.viewCleanup) {
       try {

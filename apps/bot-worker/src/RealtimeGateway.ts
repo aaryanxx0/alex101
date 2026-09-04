@@ -195,7 +195,8 @@ export class RealtimeGateway {
           this.sendError(client.ws, 'NOT_CONTROLLER', 'You must hold the control lock to connect.');
           return;
         }
-        this.deps.bot.connect(msg.options).catch((err) => {
+        this.deps.log.info('gateway', `CONNECT command received from dashboard (requestId=${msg.requestId ?? 'n/a'})`);
+        this.deps.bot.connect(msg.options, msg.requestId).catch((err) => {
           this.deps.log.error('gateway', `Connect failed: ${(err as Error).message}`);
         });
         return;
