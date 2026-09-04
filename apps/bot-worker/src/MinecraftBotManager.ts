@@ -10,6 +10,7 @@ import { classifyError, isPermanent } from './errorClassifier.js';
 import type { PathfinderController } from './PathfinderController.js';
 import type { ControlSessionManager } from './ControlSessionManager.js';
 import { EventEmitter } from 'node:events';
+import dns from 'node:dns';
 
 const BACKOFF_BASE_MS = 5000;
 const BACKOFF_MAX_MS = 60_000;
@@ -93,6 +94,8 @@ export class MinecraftBotManager extends EventEmitter {
   private sessionId = 'mc-0';
   /** Millisecond timeline for the current session (Phase 14 correlation). */
   private timeline: { create: number; spawn: number; firstAuthMsg: number; authSent: number; end: number } = { create: 0, spawn: 0, firstAuthMsg: 0, authSent: 0, end: 0 };
+  /** Ring of recent packet names/states for disconnect diagnosis. */
+  private packetRing: string[] = [];
 
   constructor(
     private readonly log: LogManager,
@@ -259,8 +262,21 @@ export class MinecraftBotManager extends EventEmitter {
     this.emit('snapshot');
 
     const token = this.auth.tokenFor(options.username);
+    // IPv4 resolution: this server resolves to both A and AAAA. Render has no
+    // working IPv6 route (TCP_TIMEOUT ~300ms via hostname), so resolve A first.
+    // Purely a transport fix — no behavior/packet changes.
+    let connectHost: string = options.host;
+    try {
+      const resolved = await dns.promises.lookup(options.host, { family: 4, all: false });
+      if (resolved?.address) {
+        connectHost = resolved.address;
+        this.log.info('connection', `DNS_RESULT session=${this.sessionId} ${options.host} → ${connectHost} (IPv4)`);
+      }
+    } catch (err) {
+      this.log.warn('connection', `DNS_RESULT session=${this.sessionId} IPv4 lookup failed (${(err as Error).message}) — using hostname`);
+    }
     const createOpts: Record<string, unknown> = {
-      host: options.host,
+      host: connectHost,
       port: options.port,
       username: actualUsername,
       version: options.version,
@@ -301,6 +317,32 @@ export class MinecraftBotManager extends EventEmitter {
     this.bot = bot;
     this.store.patchConnection({ actualUsername });
     this.store.setStartedAt(Date.now());
+
+    // ---- Packet tracing (name + state only; payload for interesting packets) ----
+    this.packetRing = [];
+    const INTEREST = /^(open_sign_editor|open_window|open_screen|open_horse_window|block_entity_data|block_update|block_action|update_sign|sign_update|open_book|close_window|close_container|custom_payload|client_command|disconnect|kick_disconnect|chat_command|chat_message|server_links|cookie_request|store_cookie|select_known_packs|feature_flags|registry_data|keep_alive|position|teleport|login|success|set_compression)$/i;
+    const trace = (dir: 'IN' | 'OUT', name: string, state: string, data?: any) => {
+      const entry = `${new Date().toISOString()} ${dir} ${state}/${name}`;
+      this.packetRing.push(entry);
+      if (this.packetRing.length > 40) this.packetRing.shift();
+      if (INTEREST.test(name)) {
+        let detail = '';
+        if (data) { try { detail = JSON.stringify(data); } catch { detail = '(unserializable)'; } }
+        this.log.info('packet', `RAW_${dir}_PACKET session=${this.sessionId} name=${name} state=${state}${detail ? ` payload=${detail.slice(0, 300)}` : ''}`);
+      }
+    };
+    try {
+      bot._client.on('packet', (data: any, meta: any) => {
+        trace('IN', meta?.name ?? '?', meta?.state ?? '?', data);
+      });
+      const origWrite = bot._client.write.bind(bot._client);
+      bot._client.write = (name: string, data: any) => {
+        trace('OUT', name, bot._client.state, data);
+        return origWrite(name, data);
+      };
+    } catch (err) {
+      this.log.warn('connection', `Packet trace hook failed: ${(err as Error).message}`);
+    }
 
     bot.once('spawn', async () => {
       this.timeline.spawn = Date.now();
@@ -490,6 +532,7 @@ export class MinecraftBotManager extends EventEmitter {
     const combined = `${kindRaw} ${rawMessage}`;
     const reason = classifyError(combined, code);
     this.log.warn('connection', `Disconnected session=${this.sessionId} source=${disconnectSource} reason=${reason} raw="${rawMessage}" authState=${this.authState}`);
+    this.log.warn('connection', `LAST_20_PACKETS session=${this.sessionId} [${this.packetRing.slice(-20).join(' | ')}]`);
     if (this.timeline.spawn) {
       this.log.warn('connection', `TIMELINE session=${this.sessionId} CREATE→SPAWN=${this.timeline.spawn - this.timeline.create}ms SPAWN→END=${this.timeline.end - this.timeline.spawn}ms firstAuthMsg=${this.timeline.firstAuthMsg ? `${this.timeline.firstAuthMsg - this.timeline.spawn}ms after SPAWN` : 'never'} authSent=${this.timeline.authSent ? `${this.timeline.authSent - this.timeline.spawn}ms after SPAWN` : 'never'}`);
     }
