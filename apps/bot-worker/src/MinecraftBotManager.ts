@@ -888,7 +888,9 @@ export class MinecraftBotManager extends EventEmitter {
   }
 
   private async startViewer(options: ConnectOptions): Promise<void> {
+    this.log.info('viewer', `VIEWER_START_REQUEST session=${this.sessionId} viewDistance=${options.viewDistance}`);
     if (!options.viewDistance || options.viewDistance <= 0) {
+      this.log.warn('viewer', `VIEWER_START_FAILED — viewDistance=${options.viewDistance}, viewer disabled`);
       this.store.patchViewer({ renderDistance: 0, ready: false });
       return;
     }
@@ -897,11 +899,11 @@ export class MinecraftBotManager extends EventEmitter {
       this.view = view;
       const url = this.viewerMgr.baseUrl();
       this.store.patchViewer({ ready: true, socketConnected: true, viewerBaseUrl: url });
-      this.log.success('viewer', `prismarine-viewer started at ${url}`);
+      this.log.success('viewer', `VIEWER_RUNNING — prismarine-viewer serving at ${url} (public path: /viewer via same-port proxy)`);
       this.emit('viewer', this.store.get().viewer);
       this.emit('snapshot');
     } catch (err) {
-      this.log.error('viewer', `Viewer failed to start: ${(err as Error).message}`);
+      this.log.error('viewer', `VIEWER_START_FAILED session=${this.sessionId}: ${(err as Error).message}\n${(err as Error).stack ?? ''}`);
       this.store.patchViewer({ lastError: (err as Error).message });
       this.emit('snapshot');
     }

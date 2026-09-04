@@ -40,9 +40,21 @@ export class ViewerManager {
     if (this.active) {
       await this.stop();
     }
-    this.log.info('viewer', `Starting prismarine-viewer (distance ${viewDistance}) on port ${this.port}`);
+    const registryVersion = bot.registry?.version?.minecraftVersion ?? bot.version ?? 'unknown';
+    let viewerVersion = 'unknown';
+    try { viewerVersion = (await import('prismarine-viewer/package.json', { with: { type: 'json' } } as any)).default.version; } catch {
+      try { viewerVersion = require('prismarine-viewer/package.json').version; } catch {}
+    }
+    this.log.info('viewer', `VIEWER_STARTING session-ready: bot version=${registryVersion} node=${process.version} prismarine-viewer=${viewerVersion} port=${this.port} host=${this.host} viewDistance=${viewDistance}`);
     // prismarine-viewer uses an Express+http server internally.
-    const { mineflayer: mineflayerViewer } = await import('prismarine-viewer');
+    let mineflayerViewer: any;
+    try {
+      const mod = await import('prismarine-viewer');
+      mineflayerViewer = mod.mineflayer;
+    } catch (err) {
+      this.log.error('viewer', `VIEWER_START_FAILED — cannot import prismarine-viewer: ${(err as Error).message}\n${(err as Error).stack ?? ''}`);
+      throw err;
+    }
     await new Promise<void>((resolve, reject) => {
       try {
         const view = mineflayerViewer(bot, {
@@ -51,6 +63,7 @@ export class ViewerManager {
           viewDistance,
           firstPerson: true,
         } as any);
+        this.log.info('viewer', `VIEWER_INTERNAL_SERVER_LISTENING at ${this.host}:${this.port} (proxy paths: HTTP /viewer/*, WS /socket.io/*)`);
         // prismarine-viewer returns an HTTP server-like value; treat as a closeable.
         this.active = {
           close: async () => {
@@ -67,6 +80,7 @@ export class ViewerManager {
         };
         resolve();
       } catch (err) {
+        this.log.error('viewer', `VIEWER_START_FAILED — mineflayerViewer threw: ${(err as Error).message}\n${(err as Error).stack ?? ''}`);
         reject(err);
       }
     });

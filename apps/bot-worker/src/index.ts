@@ -110,7 +110,7 @@ app.get('/health', (_req: Request, res: Response) => {
       lastDisconnectMessage: conn.lastDisconnectMessage,
       lastDisconnectAt: conn.lastDisconnectAt,
       reconnectAttempts: conn.reconnectAttempts,
-      recentLogs: log.recent().slice(-30),
+      recentLogs: log.recent().slice(-200),
     });
   });
 
