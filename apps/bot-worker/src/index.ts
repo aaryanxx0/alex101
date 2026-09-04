@@ -164,8 +164,13 @@ app.get('/health', (_req: Request, res: Response) => {
   // --- Same-origin viewer proxy (single public port) ---
   // The viewer page references assets relative to its URL ("index.js"), so the
   // page MUST be served with a trailing slash or the browser resolves assets
-  // to the root and the iframe renders blank/white.
-  app.get('/viewer', (_req: Request, res: Response) => res.redirect(301, '/viewer/'));
+  // to the root and the iframe renders blank/white. Only redirect the bare
+  // path — '/viewer/' must fall through to the proxy (Express matches both
+  // without strict routing, which would otherwise loop forever).
+  app.use((req: Request, res: Response, next: any) => {
+    if (req.path === '/viewer') return res.redirect(301, '/viewer/');
+    next();
+  });
   // HTTP: /viewer/* and /socket.io/* → 127.0.0.1:VIEWER_PORT
   const proxyViewerHttp = (req: Request, res: Response) => {
     const proxyReq = httpRequest(
