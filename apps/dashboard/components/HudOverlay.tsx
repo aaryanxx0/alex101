@@ -7,44 +7,66 @@ interface HudOverlayProps {
   isController: boolean;
 }
 
+/** Number of full/half hearts & drumsticks from 0..20 scale values. */
+function iconsFor(value: number): { full: number; half: boolean } {
+  const v = Math.max(0, Math.min(20, value));
+  const full = Math.floor(v / 2);
+  const half = v % 2 === 1;
+  return { full, half };
+}
+
 export function HudOverlay({ snapshot, isController }: HudOverlayProps) {
-  if (!snapshot) return null;
+  if (!snapshot || snapshot.connection.state === 'OFFLINE') {
+    return (
+      <>
+        <div className="crosshair"><span /></div>
+      </>
+    );
+  }
   const { position, player, control, connection, inventory, nearbyPlayers } = snapshot;
-  const health = Math.max(0, Math.min(20, player.health));
-  const food = Math.max(0, Math.min(20, player.food));
+  const hearts = iconsFor(player.health);
+  const foodIcons = iconsFor(player.food);
   const xpPct = Math.max(0, Math.min(1, player.xpProgress));
   return (
     <>
-      <div className="hud-overlay hud-top-left">
-        <div className="hud-bar"><span>♥</span>
-          <div className="mc-health-bar"><div style={{ width: `${(health / 20) * 100}%` }} /></div>
-          <span>{health.toFixed(0)}</span>
-        </div>
-        <div className="hud-bar"><span>🍗</span>
-          <div className="mc-food-bar"><div style={{ width: `${(food / 20) * 100}%` }} /></div>
-          <span>{food.toFixed(0)}</span>
-        </div>
-        <div className="hud-bar"><span>XP</span>
-          <div className="hud-xp"><div style={{ width: `${xpPct * 100}%` }} /></div>
-          <span>Lv {player.xpLevel}</span>
-        </div>
-      </div>
+      {/* Minimal info — top-right only (old large top-left bars removed) */}
       <div className="hud-overlay hud-top-right">
         <div className="hud-bar">{position.blockX.toFixed(0)}, {position.blockY.toFixed(0)}, {position.blockZ.toFixed(0)}</div>
         <div className="hud-bar">{position.dimension}</div>
-        <div className="hud-bar">Yaw {position.yaw.toFixed(0)}° · Pitch {position.pitch.toFixed(0)}°</div>
         <div className="hud-bar">{connection.actualUsername ?? connection.configuredUsername} · {connection.state}</div>
         {nearbyPlayers.length > 0 && <div className="hud-bar">Players nearby: {nearbyPlayers.length}</div>}
         {isController && <div className="hud-bar" style={{ background: 'rgba(46,160,67,0.7)' }}>CONTROLLER</div>}
       </div>
       <div className="crosshair"><span /></div>
-      <div className="hotbar">
-        {inventory.hotbar.map((h, i) => (
-          <div key={i} className={`hotbar-slot${player.selectedHotbarSlot === i ? ' selected' : ''}`}>
-            <div className="count">{h.count > 0 ? h.count : ''}</div>
-            <div className="name">{h.displayName ?? h.itemName ?? ''}</div>
+
+      {/* Minecraft-style bottom HUD: hearts / hunger / xp / hotbar */}
+      <div className="mc-hud">
+        <div className="mc-hud-row">
+          <div className="mc-hearts" aria-label={`Health ${player.health}/20`}>
+            {Array.from({ length: 10 }, (_, i) => {
+              const cls = i < hearts.full ? 'full' : (i === hearts.full && hearts.half ? 'half' : 'empty');
+              return <span key={i} className={`mc-heart ${cls}`} />;
+            })}
           </div>
-        ))}
+          <div className="mc-hunger" aria-label={`Hunger ${player.food}/20`}>
+            {Array.from({ length: 10 }, (_, i) => {
+              const cls = i < foodIcons.full ? 'full' : (i === foodIcons.full && foodIcons.half ? 'half' : 'empty');
+              return <span key={i} className={`mc-food-icon ${cls}`} />;
+            })}
+          </div>
+        </div>
+        <div className="mc-xp-wrap">
+          {player.xpLevel > 0 && <span className="mc-xp-level">{player.xpLevel}</span>}
+          <div className="mc-xp-bar"><div style={{ width: `${xpPct * 100}%` }} /></div>
+        </div>
+        <div className="hotbar">
+          {inventory.hotbar.map((h, i) => (
+            <div key={i} className={`hotbar-slot${player.selectedHotbarSlot === i ? ' selected' : ''}`}>
+              <div className="count">{h.count > 0 ? h.count : ''}</div>
+              <div className="name">{h.displayName ?? h.itemName ?? ''}</div>
+            </div>
+          ))}
+        </div>
       </div>
     </>
   );

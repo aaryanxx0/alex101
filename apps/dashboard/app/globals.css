@@ -415,6 +415,110 @@ label { display: block; font-size: 12px; color: var(--fg-2); margin-bottom: 4px;
   .toast-stack { top: 8px; width: 94vw; }
 }
 
+/* --- Minecraft-style bottom HUD (hearts / hunger / xp / hotbar) --- */
+.mc-hud {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+  max-width: calc(100% - 16px);
+}
+.mc-hud-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  width: 346px;
+  max-width: 100%;
+}
+.mc-hearts, .mc-hunger { display: flex; gap: 1px; }
+.mc-heart, .mc-food-icon { width: 16px; height: 16px; display: inline-block; position: relative; image-rendering: pixelated; }
+.mc-heart { background: #3a0b0b; border: 1px solid #1a0505; border-radius: 2px; }
+.mc-heart:before {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: #e5312f;
+  clip-path: polygon(50% 100%, 0 45%, 0 20%, 20% 0, 42% 0, 50% 12%, 58% 0, 80% 0, 100% 20%, 100% 45%);
+}
+.mc-heart.empty { background: #2a2a2a; border-color: #181818; }
+.mc-heart.empty:before { background: #4a3232; opacity: .55; }
+.mc-heart.half { background: #3a0b0b; }
+.mc-heart.half:before {
+  background: #e5312f;
+  clip-path: polygon(50% 100%, 0 45%, 0 20%, 20% 0, 42% 0, 50% 12%, 50% 100%);
+}
+.mc-food-icon { background: #3d2208; border: 1px solid #1d0f02; border-radius: 2px; }
+.mc-food-icon:before {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: #c2793a;
+  clip-path: polygon(35% 0, 70% 0, 90% 25%, 85% 60%, 60% 80%, 45% 100%, 25% 90%, 20% 65%, 10% 40%, 15% 15%);
+}
+.mc-food-icon:after {
+  content: '';
+  position: absolute;
+  left: 30%;
+  top: 60%;
+  width: 18%;
+  height: 34%;
+  background: #e8dcc8;
+  transform: rotate(25deg);
+  border-radius: 40%;
+}
+.mc-food-icon.empty { background: #242424; border-color: #161616; }
+.mc-food-icon.empty:before { background: #4c4238; opacity: .5; }
+.mc-food-icon.empty:after { opacity: 0; }
+.mc-food-icon.half { background: #3d2208; }
+.mc-food-icon.half:before {
+  background: #c2793a;
+  position: absolute;
+  inset: 2px;
+  clip-path: polygon(35% 0, 70% 0, 90% 25%, 85% 60%, 60% 80%, 50% 80%, 50% 0, 50% 0, 35% 0);
+}
+.mc-xp-wrap {
+  position: relative;
+  width: 346px;
+  max-width: 100%;
+  height: 8px;
+  background: rgba(0, 0, 0, .55);
+  border: 1px solid #1a1a1a;
+  border-radius: 2px;
+}
+.mc-xp-bar { height: 100%; background: linear-gradient(180deg, #a4e83e, #5da616); }
+.mc-xp-level {
+  position: absolute;
+  left: 50%;
+  top: -15px;
+  transform: translateX(-50%);
+  color: #7ef83e;
+  font-weight: 700;
+  font-size: 13px;
+  text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+  z-index: 2;
+}
+.mc-hud .hotbar {
+  position: static;
+  transform: none;
+  left: auto;
+  bottom: auto;
+  background: rgba(0, 0, 0, .6);
+  padding: 2px;
+  border-radius: 4px;
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: repeat(9, 36px);
+  grid-gap: 2px;
+  gap: 2px;
+}
+@media (max-width: 640px) {
+  .mc-hud-row, .mc-xp-wrap { width: min(92vw, 346px); }
+}
+
 .login-shell {
   display: flex;
   align-items: center;
