@@ -251,9 +251,17 @@ export interface ServerStatusSample {
 /* WebSocket protocol                                                  */
 /* ------------------------------------------------------------------ */
 
+export type ControlClaimStatus =
+  | 'CONTROL_GRANTED'
+  | 'CONTROL_DENIED'
+  | 'CONTROL_ALREADY_OWNED'
+  | 'CONTROL_AUTH_REQUIRED'
+  | 'CONTROL_WS_OFFLINE';
+
 export type ClientCommand =
   | { type: 'hello'; token: string; controllerId: string; controllerName: string }
   | { type: 'heartbeat'; controllerId: string; ts: number }
+  | { type: 'request-control'; take?: boolean }
   | { type: 'request-snapshot' }
   | { type: 'connect'; options: ConnectOptions; requestId?: string }
   | { type: 'disconnect' }
@@ -281,6 +289,7 @@ export type ServerEvent =
   | { type: 'log'; entry: LogEntry }
   | { type: 'chat'; message: ChatMessage }
   | { type: 'viewer-status'; viewer: ViewerState }
+  | { type: 'control-status'; status: ControlClaimStatus; message?: string }
   | { type: 'error'; code: string; message: string }
   | { type: 'kicked'; reason: DisconnectReason; raw: string };
 

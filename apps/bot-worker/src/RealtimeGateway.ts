@@ -126,14 +126,15 @@ export class RealtimeGateway {
 
   private handleConnection(ws: WebSocket, req: IncomingMessage) {
     const origin = req.headers.origin ?? '';
-    if (this.allowedOrigins.size > 0 && origin && !this.allowedOrigins.has(origin) && !this.allowedOrigins.has('*')) {
-      this.deps.log.warn('gateway', `Refused WebSocket from origin ${origin}`);
+    if (!this.isOriginAllowed(origin)) {
+      this.deps.log.warn('gateway', `WS_UPGRADE rejected — origin ${origin || '(none)'} not allowed (allowed: ${[...this.allowedOrigins].join(', ')})`);
       ws.close(1008, 'origin not allowed');
       return;
     }
+    this.deps.log.info('gateway', `WS_UPGRADE accepted — origin=${origin || '(none)'}`);
     const client: ClientSocket = { ws, controllerId: null, controllerName: null, authenticated: false };
     this.clients.add(client);
-    this.deps.log.debug('gateway', `WebSocket opened (origin=${origin || 'none'})`);
+    this.deps.log.info('gateway', `WS_CONNECTED (origin=${origin || 'none'}, clients=${this.clients.size})`);
     ws.on('message', (raw: Buffer | ArrayBuffer | Buffer[]) => {
       const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : Array.isArray(raw) ? Buffer.concat(raw).toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8');
       let msg: ClientCommand;
@@ -145,13 +146,31 @@ export class RealtimeGateway {
       }
       this.handleMessage(client, msg);
     });
-    ws.on('close', () => {
+    ws.on('close', (code: number, reason: Buffer) => {
+      this.deps.log.info('gateway', `WS_CLOSED code=${code} reason=${reason?.toString?.() || 'none'}`);
       if (client.controllerId) this.deps.control.release(client.controllerId);
       this.clients.delete(client);
     });
     ws.on('error', (err) => {
       this.deps.log.warn('gateway', `WebSocket error: ${(err as Error).message}`);
     });
+  }
+
+  /**
+   * Origin policy for the private dashboard:
+   *  - exact matches from DASHBOARD_ORIGIN always allowed
+   *  - any *.vercel.app dashboard deployment of this team allowed (single-user product;
+   *    real authorization is the HMAC token, not the origin)
+   *  - missing origin (server-to-server, curl) allowed
+   */
+  private isOriginAllowed(origin: string): boolean {
+    if (!origin || origin === 'null') return true;
+    if (this.allowedOrigins.has(origin) || this.allowedOrigins.has('*')) return true;
+    try {
+      const hostname = new URL(origin).hostname;
+      if (hostname.endsWith('.vercel.app')) return true;
+    } catch {}
+    return false;
   }
 
   private handleMessage(client: ClientSocket, msg: ClientCommand) {
@@ -174,10 +193,34 @@ export class RealtimeGateway {
         client.controllerId = msg.controllerId;
         client.controllerName = msg.controllerName;
         const acquired = this.deps.control.acquire(client.controllerId, client.controllerName);
+        this.deps.log.info('gateway', `WS_AUTHENTICATED controller=${client.controllerName} (${client.controllerId}) control=${acquired ? 'GRANTED' : 'read-only (held by another session)'}`);
         if (!acquired) {
           // Another browser owns control — still authenticate them as read-only.
         }
         this.sendWelcome(client);
+        return;
+      }
+      case 'request-control': {
+        if (!client.authenticated || !client.controllerId) {
+          this.sendTo(client, { type: 'control-status', status: 'CONTROL_AUTH_REQUIRED', message: 'Authenticate first.' });
+          return;
+        }
+        const controllerId = client.controllerId as string;
+        const controllerName = client.controllerName as string;
+        const current = this.deps.store.get().control;
+        if (msg.take && current.controllerId && current.controllerId !== controllerId) {
+          const heldById = current.controllerId;
+          this.deps.log.warn('control', `Force takeover requested by ${controllerName} — releasing ${current.controllerName}`);
+          this.deps.control.release(heldById);
+        }
+        const acquired = this.deps.control.acquire(controllerId, controllerName);
+        if (acquired) {
+          this.deps.log.info('control', `CONTROL_GRANTED → ${controllerName}`);
+          this.sendTo(client, { type: 'control-status', status: 'CONTROL_GRANTED' });
+        } else {
+          this.deps.log.info('control', `CONTROL_DENIED → ${controllerName} (held by ${current.controllerName})`);
+          this.sendTo(client, { type: 'control-status', status: 'CONTROL_DENIED', message: `Alex101 is controlled by another session${current.controllerName ? ` (${current.controllerName})` : ''}.` });
+        }
         return;
       }
       case 'heartbeat': {
@@ -354,6 +397,9 @@ export class RealtimeGateway {
       recentChat,
     };
     this.sendTo(client, welcome);
+    // The initial full snapshot is sent immediately on authentication — even
+    // while the bot is OFFLINE — so the dashboard never waits on events.
+    this.deps.log.info('gateway', `INITIAL_SNAPSHOT_SENT (bot state=${snapshot.connection.state}, logs=${recentLogs.length}, chat=${recentChat.length})`);
   }
 
   private sendSnapshot(client: ClientSocket) {

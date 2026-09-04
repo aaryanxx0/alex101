@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import compression from 'compression';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import net from 'node:net';
 import { WebSocketServer } from 'ws';
 import { LogManager } from './LogManager.js';
 import { ConfigManager } from './ConfigManager.js';
@@ -16,8 +17,11 @@ import { classifyError } from './errorClassifier.js';
 import { DEFAULT_SETTINGS, makeId } from '@alex101/shared';
 
 const HOST = process.env.BOT_WORKER_HOST || '0.0.0.0';
-const PORT = Number(process.env.BOT_WORKER_PORT || 4000);
+const PORT = Number(process.env.PORT || process.env.BOT_WORKER_PORT || 4000);
 const VIEWER_PORT = Number(process.env.BOT_WORKER_VIEWER_PORT || 4001);
+// prismarine-viewer binds only to loopback; browsers reach it through the
+// same public port via /viewer and /socket.io proxies below.
+const VIEWER_INTERNAL_HOST = '127.0.0.1';
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || '';
 const SECRET = process.env.BOT_WORKER_SECRET || '';
 
@@ -31,7 +35,7 @@ async function main() {
   const config = new ConfigManager(process.env.BOT_WORKER_CONFIG || './data/settings.json');
   const store = new BotStateStore();
   const auth = new AuthManager(log);
-  const viewer = new ViewerManager(log, { host: HOST, port: VIEWER_PORT });
+  const viewer = new ViewerManager(log, { host: VIEWER_INTERNAL_HOST, port: VIEWER_PORT });
   const control = new ControlSessionManager(log, store);
   const pathfinder = new PathfinderController(log, store);
   const bot = new MinecraftBotManager(log, store, config, auth, viewer, pathfinder, control);
@@ -65,7 +69,7 @@ app.get('/health', (_req: Request, res: Response) => {
   /**
  * Token-protected routes — require x-bot-worker-secret to match SECRET.
  */
-app.post('/auth/token', (req: Request, res: Response) => {
+  app.post('/auth/token', (req: Request, res: Response) => {
     const provided = req.headers['x-bot-worker-secret'];
     if (typeof provided !== 'string' || provided !== SECRET) {
       res.status(401).json({ error: 'invalid shared secret' });
@@ -73,7 +77,11 @@ app.post('/auth/token', (req: Request, res: Response) => {
     }
     const controllerId = String(req.body?.controllerId || makeId('ctrl'));
     const token = issuer.issue(controllerId);
-    res.json({ token, controllerId, viewerBaseUrl: viewer.baseUrl() });
+    // Build the public same-origin viewer URL from the request host so the
+    // dashboard iframe always targets https://<worker>/viewer (single port).
+    const xfHost = String(req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`);
+    const xfProto = String(req.headers['x-forwarded-proto'] || (xfHost.includes('localhost') ? 'http' : 'https'));
+    res.json({ token, controllerId, viewerBaseUrl: `${xfProto}://${xfHost}/viewer` });
   });
 
   app.get('/snapshot', (req: Request, res: Response) => {
@@ -109,9 +117,59 @@ app.post('/auth/token', (req: Request, res: Response) => {
   });
 
   const httpServer = createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-  const gateway = new RealtimeGateway({ log, store, config, bot, control, pathfinder, viewerBaseUrl: () => viewer.baseUrl() });
+  // --- Same-origin viewer proxy (single public port) ---
+  // HTTP: /viewer/* and /socket.io/* → 127.0.0.1:VIEWER_PORT
+  const proxyViewerHttp = (req: Request, res: Response) => {
+    const proxyReq = httpRequest(
+      {
+        host: VIEWER_INTERNAL_HOST,
+        port: VIEWER_PORT,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host: `${VIEWER_INTERNAL_HOST}:${VIEWER_PORT}` },
+      },
+      (pres) => {
+        if (!pres.statusCode) { res.status(502).end(); return; }
+        res.writeHead(pres.statusCode, pres.headers);
+        pres.pipe(res);
+      },
+    );
+    proxyReq.on('error', (err) => {
+      log.warn('viewer', `proxy error: ${err.message}`);
+      if (!res.headersSent) res.status(502).json({ error: 'viewer not running' });
+      else res.end();
+    });
+    req.pipe(proxyReq);
+  };
+  app.use(['/viewer', '/socket.io'], proxyViewerHttp);
+
+  // --- Manual upgrade routing ---
+  const wss = new WebSocketServer({ noServer: true });
+  httpServer.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try { pathname = new URL(req.url || '/', 'http://internal').pathname; } catch {}
+    if (pathname === '/ws') {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    } else if (pathname.startsWith('/socket.io')) {
+      const upstream = net.connect(VIEWER_PORT, VIEWER_INTERNAL_HOST, () => {
+        const headerLines = [`GET ${req.url} HTTP/1.1`];
+        for (let i = 0; i < req.rawHeaders.length; i += 2) {
+          headerLines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+        }
+        upstream.write(headerLines.join('\r\n') + '\r\n\r\n');
+        if (head?.length) upstream.write(head);
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+      });
+      upstream.on('error', () => socket.destroy());
+      socket.on('error', () => upstream.destroy());
+    } else {
+      socket.destroy();
+    }
+  });
+
+  const gateway = new RealtimeGateway({ log, store, config, bot, control, pathfinder, viewerBaseUrl: () => `${VIEWER_INTERNAL_HOST}:${VIEWER_PORT}` });
   gateway.setTokenIssuer(issuer);
   if (DASHBOARD_ORIGIN) {
     for (const origin of DASHBOARD_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)) {

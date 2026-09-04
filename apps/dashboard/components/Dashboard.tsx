@@ -47,7 +47,18 @@ export function Dashboard({ workerUrl }: DashboardProps) {
   const [isController, setIsController] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
+  // ---- Diagnostics (visible with ?debug=1 or localStorage.alex101_debug=1) ----
+  const [dbg] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('debug') === '1'
+      || window.localStorage.getItem('alex101_debug') === '1';
+  });
+  const [diagToken, setDiagToken] = useState<'OK' | 'FAIL' | 'WAITING'>('WAITING');
+  const [diagWs, setDiagWs] = useState<'CONNECTING' | 'CONNECTED' | 'AUTHENTICATED' | 'CLOSED' | 'ERROR'>('CONNECTING');
+  const [diagSnapshot, setDiagSnapshot] = useState<'WAITING' | 'RECEIVED'>('WAITING');
+
   const wsRef = useRef<WebSocket | null>(null);
+  const tokenRef = useRef<string>('');
   const controllerIdRef = useRef<string>(makeId('ctrl'));
   const controllerNameRef = useRef<string>('Browser');
   const movementKeysRef = useRef<Set<string>>(new Set());
@@ -68,17 +79,22 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       if (!tokenRes.ok) {
         const err = await tokenRes.json().catch(() => ({}));
         setAuthError(err?.error || 'Failed to get token');
+        setDiagToken('FAIL');
         return;
       }
       const tokenData = await tokenRes.json();
-      setViewerUrl(tokenData.viewerBaseUrl);
+      tokenRef.current = tokenData.token;
+      setDiagToken('OK');
+      setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer');
 
       const wsUrl = workerUrl.replace(/^http/, 'ws') + '/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
+      setDiagWs('CONNECTING');
 
       ws.onopen = () => {
         setConnected(true);
+        setDiagWs('CONNECTED');
         const hello: ClientCommand = {
           type: 'hello',
           token: tokenData.token,
@@ -96,10 +112,12 @@ export function Dashboard({ workerUrl }: DashboardProps) {
             setSnapshot(msg.snapshot);
             setLogs(msg.recentLogs);
             setChat(msg.recentChat);
-            if (msg.snapshot.connection.actualUsername) setViewerUrl(msg.snapshot.viewer.viewerBaseUrl || viewerUrl);
+            setDiagWs('AUTHENTICATED');
+            setDiagSnapshot('RECEIVED');
             break;
           case 'snapshot':
             setSnapshot(msg.snapshot);
+            setDiagSnapshot('RECEIVED');
             break;
           case 'log':
             setLogs((l) => [...l, msg.entry].slice(-300));
@@ -108,7 +126,12 @@ export function Dashboard({ workerUrl }: DashboardProps) {
             setChat((c) => [...c, msg.message].slice(-200));
             break;
           case 'viewer-status':
-            setViewerUrl(msg.viewer.viewerBaseUrl || viewerUrl);
+            setViewerUrl(workerUrl.replace(/\/$/, '') + '/viewer');
+            break;
+          case 'control-status':
+            if (msg.status === 'CONTROL_GRANTED') setStatusMessage('Control granted — this browser owns Alex101.');
+            else if (msg.status === 'CONTROL_DENIED') setStatusMessage(msg.message || 'Alex101 is controlled by another session.');
+            else setStatusMessage(`Control: ${msg.status}${msg.message ? ` — ${msg.message}` : ''}`);
             break;
           case 'error':
             setStatusMessage(`${msg.code}: ${msg.message}`);
@@ -119,8 +142,10 @@ export function Dashboard({ workerUrl }: DashboardProps) {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         setConnected(false);
+        setDiagWs('CLOSED');
+        console.warn(`[alex101] WS closed code=${ev.code} reason="${ev.reason}" wasClean=${ev.wasClean}`);
         wsRef.current = null;
         // Reconnect with backoff
         reconnectAttemptRef.current++;
@@ -129,12 +154,14 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       };
 
       ws.onerror = () => {
+        setDiagWs('ERROR');
         setAuthError('WebSocket error — check worker is running');
       };
     } catch (err) {
       setAuthError((err as Error).message);
+      setDiagWs('ERROR');
     }
-  }, [workerUrl, viewerUrl]);
+  }, [workerUrl]);
 
   useEffect(() => {
     openWebSocket();
@@ -281,10 +308,25 @@ export function Dashboard({ workerUrl }: DashboardProps) {
 
   const isConnected = !!snapshot && (snapshot.connection.state === 'CONNECTED' || snapshot.connection.state === 'SPAWNED' || snapshot.connection.state === 'SPAWNING');
   const isControllerFromSnapshot = snapshot?.control?.controllerId === controllerIdRef.current;
+  const otherController = !!snapshot?.control?.controllerId && !isControllerFromSnapshot;
   useEffect(() => { setIsController(isControllerFromSnapshot); }, [isControllerFromSnapshot]);
 
+  // Auto-claim control right after authentication when no one owns it.
+  useEffect(() => {
+    if (!snapshot) return;
+    if (snapshot.control.controllerId === controllerIdRef.current) return; // we own it
+    if (snapshot.control.controllerId) return; // someone else owns it (read-only + Take control)
+    sendCommand({ type: 'request-control' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!!snapshot, snapshot?.control?.controllerId]);
+
   const onRequestControl = () => {
-    sendCommand({ type: 'hello', token: '__placeholder__', controllerId: controllerIdRef.current, controllerName: controllerNameRef.current } as any);
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !tokenRef.current) {
+      setStatusMessage('CONTROL_WS_OFFLINE — realtime connection to the worker is not available.');
+      return;
+    }
+    sendCommand({ type: 'request-control', take: otherController });
   };
 
   const onEnterPointerLock = useCallback(() => {
@@ -319,8 +361,8 @@ export function Dashboard({ workerUrl }: DashboardProps) {
               Open viewer in new tab
             </a>
           )}
-          {!isController && snapshot?.connection.state !== 'OFFLINE' && (
-            <button onClick={onRequestControl}>Request control</button>
+          {!isController && otherController && (
+            <button onClick={onRequestControl}>Take control</button>
           )}
           {isController && <span style={{ fontSize: 12, color: 'var(--good)' }}>You control Alex101</span>}
           <form action="/api/logout" method="POST">
@@ -331,9 +373,15 @@ export function Dashboard({ workerUrl }: DashboardProps) {
       </header>
 
       {authError && <div className="toast error">{authError}</div>}
+      {statusMessage && <div className="toast" style={{ background: 'var(--panel, #222)' }}>{statusMessage}</div>}
       {lastDisconnectFriendly && (
         <div className="toast error" style={{ left: 16, right: 'auto' }}>
           Last disconnect: {lastDisconnectFriendly} — {snapshot?.connection.lastDisconnectMessage}
+        </div>
+      )}
+      {dbg && (
+        <div style={{ position: 'fixed', bottom: 8, right: 8, zIndex: 9999, fontSize: 11, fontFamily: 'monospace', background: 'rgba(0,0,0,.85)', color: '#9f9', padding: '6px 10px', borderRadius: 6 }}>
+          HTTP: OK · TOKEN: {diagToken} · WS: {diagWs} · SNAPSHOT: {diagSnapshot} · CONTROL: {isController ? 'OWNED_BY_THIS_BROWSER' : otherController ? 'OWNED_BY_OTHER' : 'NONE'}
         </div>
       )}
 
@@ -351,12 +399,12 @@ export function Dashboard({ workerUrl }: DashboardProps) {
         <div className="layout">
           <div>
             <div className="viewer-shell">
-              {viewerUrl ? (
+              {isConnected && viewerUrl ? (
                 <ViewerCanvas baseUrl={viewerUrl} pointerLock={pointerLock} isConnected={isConnected} />
               ) : (
                 <div className="viewer-empty">
-                  <h2 style={{ marginTop: 0 }}>Viewer not ready yet</h2>
-                  <p className="muted">The prismarine-viewer server starts as soon as the bot spawns. Connect Alex101 to see the world.</p>
+                  <h2 style={{ marginTop: 0 }}>Alex101 is offline</h2>
+                  <p className="muted">Connect the bot to start live view. The WebGL viewer starts as soon as Alex101 spawns.</p>
                 </div>
               )}
               {!pointerLock && isController && isConnected && (

@@ -5,6 +5,14 @@ import type { BotSnapshot } from '@alex101/shared';
 
 export function InventoryPanel({ snapshot, onSelectHotbar }: { snapshot: BotSnapshot | null; onSelectHotbar: (slot: number) => void }) {
   if (!snapshot) return null;
+  if (snapshot.connection.state === 'OFFLINE') {
+    return (
+      <div className="panel">
+        <h3>Inventory</h3>
+        <div className="muted">Unavailable — bot is offline. Connect Alex101 to view its inventory.</div>
+      </div>
+    );
+  }
   const inv = snapshot.inventory;
   return (
     <div className="col" style={{ gap: 16 }}>
