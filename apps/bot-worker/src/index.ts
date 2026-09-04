@@ -247,12 +247,12 @@ app.get('/health', (_req: Request, res: Response) => {
     log.debug('pathfinder', `status=${status}`);
   });
 
-  // Ping sampling
+  // Ping sampling (0 = offline-mode/proxy placeholder → report as unknown)
   setInterval(() => {
     const liveBot = bot.getBot();
     if (!liveBot || !liveBot.player) return;
     const ping = liveBot.player.ping;
-    store.setPing({ ts: Date.now(), ms: typeof ping === 'number' ? ping : null });
+    store.setPing({ ts: Date.now(), ms: typeof ping === 'number' && ping > 0 ? ping : null });
   }, 3000).unref?.();
 
   httpServer.listen(PORT, HOST, () => {

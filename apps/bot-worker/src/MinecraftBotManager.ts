@@ -384,6 +384,9 @@ export class MinecraftBotManager extends EventEmitter {
         x: p.x,
         y: p.y,
         z: p.z,
+        blockX: Math.floor(p.x),
+        blockY: Math.floor(p.y),
+        blockZ: Math.floor(p.z),
         yaw: bot.entity.yaw ?? 0,
         pitch: bot.entity.pitch ?? 0,
         velocity: bot.entity.velocity
@@ -647,6 +650,17 @@ export class MinecraftBotManager extends EventEmitter {
       }
     }, MinecraftBotManager.AUTH_TIMEOUT_MS);
     this.authTimer.unref?.();
+    // EasyAuth auto-authenticates known accounts WITHOUT any prompt. If the
+    // server didn't ask for auth within 15s of spawn, the session is already
+    // authenticated — don't sit in WAITING_FOR_PROMPT forever.
+    setTimeout(() => {
+      if (this.authState === 'WAITING_FOR_PROMPT') {
+        this.setAuthState('AUTHENTICATED');
+        this.log.success('auth', `AUTHENTICATED_CONFIRMED session=${this.sessionId} (assumed — no auth prompt received within 15s; server auto-authenticated the account)`);
+        if (this.authTimer) { clearTimeout(this.authTimer); this.authTimer = null; }
+        this.emit('snapshot');
+      }
+    }, 15_000).unref?.();
   }
 
   /** Missing password + server demands auth → clean stop, no reconnect loop. */
@@ -851,6 +865,9 @@ export class MinecraftBotManager extends EventEmitter {
       x: bot.entity?.position?.x ?? 0,
       y: bot.entity?.position?.y ?? 0,
       z: bot.entity?.position?.z ?? 0,
+      blockX: Math.floor(bot.entity?.position?.x ?? 0),
+      blockY: Math.floor(bot.entity?.position?.y ?? 0),
+      blockZ: Math.floor(bot.entity?.position?.z ?? 0),
       yaw: bot.entity?.yaw ?? 0,
       pitch: bot.entity?.pitch ?? 0,
     });
